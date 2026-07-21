@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1007 490" width="1007" height="490" role="img" aria-label="Line">
+  <defs>
+    <linearGradient id="lineGradient" x1="90" y1="0" x2="917" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0.0" stop-color="#28ABCA"/>
+      <stop offset="0.52" stop-color="#93D265"/>
+      <stop offset="1.0" stop-color="#FFFA00"/>
+    </linearGradient>
+    <mask id="wordmark" maskUnits="userSpaceOnUse" x="0" y="0" width="1007" height="490">
+      <g fill="#ffffff">
+        <path transform="translate(90.00,440.00) scale(0.434000,-0.434000)" d="M150 57H401V0H80V699H150Z"/>
+        <path transform="translate(272.71,440.00) scale(0.434000,-0.434000)" d="M150 546V0H80V546Z"/>
+        <path transform="translate(372.10,440.00) scale(0.434000,-0.434000)" d="M558 320V0H489V312Q489 401 444.5 448.0Q400 495 323 495Q244 495 197.0 445.0Q150 395 150 298V0H80V546H150V453Q176 503 225.0 529.5Q274 556 336 556Q434 556 496.0 495.5Q558 435 558 320Z"/>
+        <path transform="translate(646.82,440.00) scale(0.434000,-0.434000)" d="M572 246H119Q122 184 149.0 140.0Q176 96 220.0 73.5Q264 51 316 51Q384 51 430.5 84.0Q477 117 492 173H566Q546 93 480.5 42.5Q415 -8 316 -8Q239 -8 178.0 26.5Q117 61 82.5 124.5Q48 188 48 273Q48 358 82.0 422.0Q116 486 177.0 520.0Q238 554 316 554Q394 554 452.5 520.0Q511 486 542.5 428.5Q574 371 574 301Q574 265 572 246ZM313 494Q235 494 180.0 444.0Q125 394 119 303H503Q504 364 478.5 407.0Q453 450 409.0 472.0Q365 494 313 494Z"/>
+      </g>
+    </mask>
+  </defs>
+
+  <!-- browser window frame -->
+  <rect x="14.0" y="14.0" width="978.8" height="462.0" rx="46.0" fill="none" stroke="#8D8D8D" stroke-width="9"/>
+  <polyline points="14.0,118.0 992.8,118.0" fill="none" stroke="#8D8D8D" stroke-width="9" stroke-linecap="butt" stroke-linejoin="round"/>
+  <circle cx="66.0" cy="66.0" r="15.0" fill="#8D8D8D"/>
+  <circle cx="118.0" cy="66.0" r="15.0" fill="#8D8D8D"/>
+  <circle cx="170.0" cy="66.0" r="15.0" fill="#8D8D8D"/>
+
+  <!-- wordmark: gradient shown through the letter shapes -->
+  <rect x="0" y="118" width="1007" height="372" fill="url(#lineGradient)" mask="url(#wordmark)"/>
+</svg>
