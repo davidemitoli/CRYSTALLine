@@ -57,7 +57,23 @@
 
 ## Screenshots
 
-> _Add a screenshot or two here (e.g. `docs/screenshot.png`)._
+<p align="center">
+  <img src="docs/screen1.png" alt="Main window" width="820"><br>
+  <em>The main window — crystallographic info, the interactive 3D view and the
+  phonon-mode list (brucite, Mg(OH)₂).</em>
+</p>
+
+<p align="center">
+  <img src="docs/screen2.png" alt="Raman spectrum and animation export" width="820"><br>
+  <em>A computed Raman spectrum beside the structure, with the phonon-animation
+  export dialog (thiourea).</em>
+</p>
+
+<p align="center">
+  <img src="docs/screen3.png" alt="Display panel, polyhedra and elastic surface" width="820"><br>
+  <em>The Display panel and coordination polyhedra on a 2×2×2 supercell, with a
+  Young's-modulus elastic surface.</em>
+</p>
 
 ## Architecture
 
@@ -76,23 +92,6 @@ src/crystalline/
 Only `ui/` (and the viewport that embeds the VTK interactor) imports Qt. Adding a
 new property (a new plot, panel, …) is a matter of dropping a widget into
 `ui/panels/` and wiring its signals in `MainWindow`.
-
-## Installation
-
-CRYSTALLine needs Python ≥ 3.9. It depends on PySide6, PyVista, pyvistaqt,
-NumPy, ASE, pymatgen and CRYSTALClear (installed automatically).
-
-```sh
-git clone https://github.com/<your-username>/CRYSTALLine.git
-cd CRYSTALLine
-pip install -e .
-```
-
-Optional developer extras (tests):
-
-```sh
-pip install -e ".[dev]"
-```
 
 ## Usage
 
