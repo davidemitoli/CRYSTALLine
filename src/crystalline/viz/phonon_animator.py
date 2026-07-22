@@ -1,0 +1,58 @@
+"""Animate a phonon mode by displacing atoms along its eigenvector.
+
+The animator is intentionally *timer-free*: it computes the geometry for a
+given phase and pushes it to the renderer via ``update_positions``. The UI owns
+the ``QTimer`` and advances the phase, so this stays Qt-independent and testable.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from crystalline.core.phonons import PhononMode, displaced_positions
+from crystalline.viz.renderer import StructureRenderer
+
+
+class PhononAnimator:
+    """Drive a :class:`StructureRenderer` to show a vibrating mode."""
+
+    def __init__(self, renderer: StructureRenderer) -> None:
+        self.renderer = renderer
+        self._equilibrium: np.ndarray | None = None
+        self._mode: PhononMode | None = None
+        self.amplitude: float = 0.5
+
+    def set_mode(self, equilibrium: np.ndarray, mode: PhononMode) -> None:
+        """Select the mode to animate around a fixed equilibrium geometry."""
+        self._equilibrium = np.asarray(equilibrium, dtype=float)
+        self._mode = mode
+
+    def set_frame(self, phase: float) -> None:
+        """Render one frame at animation ``phase`` (radians)."""
+        if self._mode is None or not self._matches_renderer():
+            return
+        pos = displaced_positions(self._equilibrium, self._mode, self.amplitude, phase)
+        self.renderer.update_positions(pos)
+
+    def reset(self) -> None:
+        """Return atoms to their equilibrium positions."""
+        if self._matches_renderer():
+            self.renderer.update_positions(self._equilibrium)
+
+    def _matches_renderer(self) -> bool:
+        """Whether the held equilibrium still fits the renderer's atom count.
+
+        The displayed structure can be swapped for a different one — a supercell,
+        a different cell view — between when a mode was set and when a frame (or a
+        reset from ``PhononPanel._stop``) fires. Pushing the stale, wrong-sized
+        equilibrium would raise in ``update_positions``; skip instead.
+        """
+        return self._equilibrium is not None and len(self._equilibrium) == self.renderer.atom_count
+
+    @staticmethod
+    def phase_sequence(n_frames: int = 60) -> np.ndarray:
+        """A full 0..2*pi loop suitable for cycling with a timer."""
+        return np.linspace(0.0, 2.0 * np.pi, n_frames, endpoint=False)
+
+
+__all__ = ["PhononAnimator"]
