@@ -1,0 +1,124 @@
+name: Publish to PyPI
+
+# Publishes whenever a GitHub Release is published (this fires for prereleases
+# too, and for drafts at the moment you publish them). Nothing is uploaded on a
+# plain merge to main - cutting a release is the deliberate act that ships.
+#
+# To release: bump the version in pyproject.toml AND src/crystalline/__init__.py,
+# merge that, then create a GitHub Release whose tag matches (e.g. v0.2.0).
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: publish-pypi
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Verify version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Three things must agree before anything is built: pyproject.toml,
+      # src/crystalline/__init__.py, and the release tag. A mismatch here is
+      # cheap to fix; a wrong version on PyPI is permanent.
+      - name: Cross-check version against the release tag
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, pathlib, re, sys, tomllib
+
+          pyproject = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          version = pyproject["project"]["version"]
+
+          init = pathlib.Path("src/crystalline/__init__.py").read_text()
+          match = re.search(r'^__version__\s*=\s*["\'](.+?)["\']', init, re.M)
+          if match is None:
+              sys.exit("no __version__ found in src/crystalline/__init__.py")
+          if match.group(1) != version:
+              sys.exit(
+                  f"version mismatch: pyproject.toml says {version}, "
+                  f"src/crystalline/__init__.py says {match.group(1)}"
+              )
+
+          # workflow_dispatch has no release payload; tag check is skipped there.
+          tag = os.environ.get("RELEASE_TAG", "")
+          if tag:
+              if tag.removeprefix("v") != version:
+                  sys.exit(
+                      f"release tag {tag!r} does not match version {version!r} "
+                      f"in pyproject.toml"
+                  )
+              # stdout is redirected into $GITHUB_OUTPUT, so annotations go to stderr.
+              print(f"::notice::Releasing crystalline {version} from tag {tag}",
+                    file=sys.stderr)
+
+          print(f"version={version}")
+          PY
+
+      # PyPI refuses to overwrite an existing version. Catching it here gives a
+      # clear error instead of a confusing 400 at the upload step.
+      - name: Ensure the version is not already on PyPI
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://pypi.org/pypi/crystalline/${version}/json")
+          case "$status" in
+            404) echo "crystalline ${version} is not on PyPI - good to publish." ;;
+            200) echo "::error::crystalline ${version} is already on PyPI. Bump the version and cut a new release."; exit 1 ;;
+            *)   echo "::error::Unexpected response from PyPI (HTTP ${status}); refusing to guess."; exit 1 ;;
+          esac
+
+  build:
+    name: Build sdist and wheel
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      # Catches a malformed README or bad metadata before PyPI rejects the
+      # upload - at which point the version number is burnt and needs a bump.
+      - name: Validate metadata
+        run: python -m twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/crystalline
+    permissions:
+      id-token: write # required for PyPI trusted publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
