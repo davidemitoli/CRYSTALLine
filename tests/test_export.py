@@ -58,6 +58,25 @@ def test_render_animation_frames_shape(nacl):
     assert not all(np.array_equal(frames[0], f) for f in frames[1:])
 
 
+def test_apply_camera_preserves_parallel_zoom():
+    """The export must reproduce the on-screen zoom. Under parallel projection that
+    zoom is the camera's parallel scale, which a bare ``camera_position`` omits —
+    so the full snapshot must be applied, or the render zooms in."""
+    plotter = pv.Plotter(off_screen=True)
+    try:
+        plotter.add_mesh(pv.Sphere())
+        plotter.enable_parallel_projection()
+        snapshot = (plotter.camera_position, 0.37, plotter.camera.GetViewAngle())
+
+        export._apply_camera(plotter, snapshot)
+        assert np.isclose(plotter.camera.GetParallelScale(), 0.37)  # zoom applied
+
+        # a bare camera_position must still work (placement only, no crash)
+        export._apply_camera(plotter, plotter.camera_position)
+    finally:
+        plotter.close()
+
+
 def test_save_animation_gif(tmp_path):
     frames = [np.full((20, 30, 3), i * 20, np.uint8) for i in range(5)]
     out = export.save_animation(frames, str(tmp_path / "anim.gif"), fps=10)

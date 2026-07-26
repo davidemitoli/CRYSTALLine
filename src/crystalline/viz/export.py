@@ -77,8 +77,12 @@ def render_animation_frames(
     """Render one full vibration cycle off-screen; return a list of RGB frames.
 
     A fresh off-screen plotter/renderer is used so nothing about the live view
-    changes. ``camera`` (a pyvista ``camera_position``) matches the on-screen
-    orientation when supplied; otherwise the structure is auto-framed.
+    changes. ``camera`` reproduces the on-screen view when supplied; otherwise the
+    structure is auto-framed. It may be either a plain pyvista ``camera_position``
+    or a ``(camera_position, parallel_scale, view_angle)`` snapshot — the latter is
+    needed under parallel (orthographic) projection, where the zoom lives in the
+    parallel scale, *not* in ``camera_position`` (so passing only the placement
+    would let the off-screen plotter reframe and zoom the view).
     """
     plotter = pv.Plotter(off_screen=True, window_size=window_size)
     try:
@@ -86,7 +90,7 @@ def render_animation_frames(
         renderer.set_reference_cell(reference_cell)
         renderer.set_structure(structure, bond_structure=bond_structure)
         if camera is not None:
-            plotter.camera_position = camera
+            _apply_camera(plotter, camera)
         else:
             plotter.reset_camera()
 
@@ -101,6 +105,24 @@ def render_animation_frames(
         return frames
     finally:
         plotter.close()
+
+
+def _apply_camera(plotter, camera) -> None:
+    """Reproduce ``camera`` on ``plotter`` — placement, and zoom if provided.
+
+    ``camera`` is either a bare ``camera_position`` (placement only) or a
+    ``(camera_position, parallel_scale, view_angle)`` snapshot. Applying the
+    parallel scale is what keeps a parallel-projection render at the on-screen zoom.
+    The two are told apart by the second element: a scalar (the parallel scale) for
+    the snapshot, a focal-point vector for a bare ``camera_position``.
+    """
+    if np.isscalar(camera[1]):
+        position, parallel_scale, view_angle = camera
+        plotter.camera_position = position
+        plotter.camera.SetParallelScale(parallel_scale)
+        plotter.camera.SetViewAngle(view_angle)
+    else:
+        plotter.camera_position = camera
 
 
 def save_animation(frames: List[np.ndarray], path: str, *, fps: int = DEFAULT_FPS) -> List[str]:

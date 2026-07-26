@@ -6,7 +6,7 @@ easy to unit-test and to drive from a settings dialog.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Tuple
 
 
@@ -22,16 +22,13 @@ class RenderSettings:
     # absent here keep their default Jmol colour.
     atom_colors: Tuple[Tuple[int, str], ...] = field(default_factory=tuple)
 
-    # bonds
+    # bonds — a single fixed colour (see renderer._BOND_COLOR); no per-bond colouring
     show_bonds: bool = True
     bond_radius: float = 0.06    # Angstrom
     bond_tolerance: float = 1.15  # bonded if dist < tolerance * (r_i + r_j)
 
-    # bonds (continued)
-    bond_color: str = "#888888"   # "colour 1": solid, and one half of split/gradient
-    bond_color2: str = "#4c72b0"  # "colour 2": the other half of split / end of gradient
-    # "solid" (colour 1), "split" (half colour 1 / half colour 2), "gradient" (1 → 2).
-    bond_color_mode: str = "solid"
+    # hydrogen bonds — dashed D–H···A contacts, drawn by default
+    show_hydrogen_bonds: bool = True
 
     # cell / gizmo
     show_cell: bool = True
@@ -41,19 +38,21 @@ class RenderSettings:
     show_atom_labels: bool = False
     atom_label_size: int = 16  # point size of the element-symbol labels
 
-    # coordination polyhedra (VESTA-style)
-    show_polyhedra: bool = False
-    polyhedra_opacity: float = 0.75
+    # coordination polyhedra (VESTA-style), shown by default
+    show_polyhedra: bool = True
+    polyhedra_opacity: float = 0.3  # translucent enough to see the atoms inside
     polyhedra_min_vertices: int = 4  # only draw around atoms with >= this many bonds
+
+    # geometry-measurement overlays (Geometry panel): dot markers, distance/angle
+    # paths, and least-squares plane patches — each independently coloured.
+    measure_point_color: str = "#ff7f0e"  # dot markers
+    measure_line_color: str = "#ff7f0e"   # distance / angle / dihedral paths
+    measure_plane_color: str = "#1f77b4"  # least-squares plane patches
 
     # scene / camera
     background_color: str = "white"
-    parallel_projection: bool = False   # orthographic when True, perspective otherwise
+    parallel_projection: bool = True    # orthographic by default; perspective when False
     show_orientation_axes: bool = False  # the little xyz marker in the corner
-
-    def evolve(self, **changes) -> "RenderSettings":
-        """Return a copy with some fields overridden (settings are immutable)."""
-        return replace(self, **changes)
 
 
 __all__ = ["RenderSettings"]

@@ -36,8 +36,6 @@ from PySide6.QtWidgets import (
 
 from crystalline.viz.render_settings import RenderSettings
 
-_BOND_MODES = ("solid", "split", "gradient")
-
 
 def _jmol_hex(z: int) -> str:
     """The default Jmol colour of element ``z`` as ``#rrggbb``."""
@@ -58,8 +56,9 @@ class DisplayPanel(QWidget):
         self._on_change = on_change
         self._loading = True
         self._bg_color = settings.background_color
-        self._bond_color = settings.bond_color
-        self._bond_color2 = settings.bond_color2
+        self._measure_point_color = settings.measure_point_color
+        self._measure_line_color = settings.measure_line_color
+        self._measure_plane_color = settings.measure_plane_color
         # Per-element colour overrides {Z: "#rrggbb"} and their swatch buttons.
         self._atom_colors: dict = {int(z): c for z, c in settings.atom_colors}
         self._elem_buttons: dict = {}
@@ -105,18 +104,9 @@ class DisplayPanel(QWidget):
         self._show_bonds = self._check(bonds, "Show bonds", settings.show_bonds)
         self._bond_radius = self._float_row(bonds, "Radius (Å)", settings.bond_radius, 0.02, 1.2, 0.02)
         self._bond_tol = self._float_row(bonds, "Tolerance", settings.bond_tolerance, 1.0, 2.0, 0.05)
-        mode_index = _BOND_MODES.index(settings.bond_color_mode) if settings.bond_color_mode in _BOND_MODES else 0
-        self._bond_mode = self._combo(
-            bonds, "Colour by", ["Solid colour", "Split (by atom)", "Gradient"], mode_index
+        self._show_hbonds = self._check(
+            bonds, "Show hydrogen bonds", settings.show_hydrogen_bonds
         )
-        # Two bond colours: colour 1 is used for solid (and one half of split /
-        # the start of a gradient); colour 2 is the other half / gradient end.
-        self._bond_color_btn = self._color_row(bonds, "Colour 1", "_bond_color")
-        self._bond_color2_btn = self._color_row(bonds, "Colour 2", "_bond_color2")
-        hint = QLabel("Colour 2 is used by split & gradient.")
-        hint.setEnabled(False)
-        hint.setWordWrap(True)
-        bonds.addRow("", hint)
 
         # ── Cell & axes ──
         cell = self._group(layout, "Cell & axes")
@@ -129,6 +119,12 @@ class DisplayPanel(QWidget):
         self._show_poly = self._check(poly, "Show polyhedra", settings.show_polyhedra)
         self._poly_opacity = self._float_row(poly, "Opacity", settings.polyhedra_opacity, 0.05, 1.0, 0.05)
         self._poly_min = self._int_row(poly, "Min. coordination", settings.polyhedra_min_vertices, 3, 12)
+
+        # ── Measurements ── (Geometry panel overlays: dots, paths, plane patches)
+        measure = self._group(layout, "Measurements")
+        self._measure_point_btn = self._color_row(measure, "Dots", "_measure_point_color")
+        self._measure_line_btn = self._color_row(measure, "Lines", "_measure_line_color")
+        self._measure_plane_btn = self._color_row(measure, "Planes", "_measure_plane_color")
 
         # ── Scene ──
         scene = self._group(layout, "Scene")
@@ -287,15 +283,16 @@ class DisplayPanel(QWidget):
                 show_bonds=self._show_bonds.isChecked(),
                 bond_radius=self._bond_radius.value(),
                 bond_tolerance=self._bond_tol.value(),
-                bond_color=self._bond_color,
-                bond_color2=self._bond_color2,
-                bond_color_mode=_BOND_MODES[self._bond_mode.currentIndex()],
+                show_hydrogen_bonds=self._show_hbonds.isChecked(),
                 show_cell=self._show_cell.isChecked(),
                 show_lattice_vectors=self._show_axes.isChecked(),
                 show_orientation_axes=self._show_orient.isChecked(),
                 show_polyhedra=self._show_poly.isChecked(),
                 polyhedra_opacity=self._poly_opacity.value(),
                 polyhedra_min_vertices=self._poly_min.value(),
+                measure_point_color=self._measure_point_color,
+                measure_line_color=self._measure_line_color,
+                measure_plane_color=self._measure_plane_color,
                 background_color=self._bg_color,
                 parallel_projection=self._projection.currentIndex() == 1,
             )

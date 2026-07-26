@@ -299,9 +299,6 @@ class PlotPanel(QWidget):
         self._tabs.setCurrentIndex(index)
         self._stack.setCurrentWidget(self._tabs)
 
-    def has_plots(self) -> bool:
-        return self._tabs.count() > 0
-
     # ── internals ───────────────────────────────────────────────────────
     def _close_tab(self, index: int) -> None:
         widget = self._tabs.widget(index)

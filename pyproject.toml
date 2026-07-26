@@ -37,3 +37,5 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Run the suite straight from a checkout (as the README says), no install needed.
+pythonpath = ["src"]

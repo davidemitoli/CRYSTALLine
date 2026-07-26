@@ -133,6 +133,11 @@ def _wrap_molecules(atoms, mult: float = 1.15):
 
     n = len(atoms)
     cell = np.asarray(atoms.cell, dtype=float)
+    # Only wrap along periodic axes. A slab/polymer's aperiodic axis carries
+    # CRYSTAL's formal 500 Å vector; wrapping a slab centred on z = 0 into [0, 1)
+    # there would fling its negative-z atoms to z ≈ 500, splitting it into two
+    # sheets half a micron apart.
+    periodic = np.asarray(atoms.pbc, dtype=bool)
     neighbours: list[list] = [[] for _ in range(n)]
     for a, b, disp in zip(i, j, offset):
         neighbours[a].append((b, disp))
@@ -157,10 +162,15 @@ def _wrap_molecules(atoms, mult: float = 1.15):
         comp = np.asarray(component)
         frac = np.linalg.solve(cell.T, unwrapped[comp].T).T
         if np.any(frac.max(0) - frac.min(0) >= 1.0):
-            # Extended framework: reassembly is meaningless — wrap each atom.
-            unwrapped[comp] = (frac % 1.0) @ cell
+            # Extended framework: reassembly is meaningless — wrap each atom, but
+            # only along periodic axes (aperiodic coordinates stay put).
+            wrapped = frac.copy()
+            wrapped[:, periodic] = frac[:, periodic] % 1.0
+            unwrapped[comp] = wrapped @ cell
         else:
-            unwrapped[comp] -= np.floor(frac[0]) @ cell  # anchor into [0, 1)
+            shift = np.floor(frac[0])
+            shift[~periodic] = 0.0  # never translate along an aperiodic axis
+            unwrapped[comp] -= shift @ cell  # anchor into [0, 1)
 
     out = atoms.copy()
     out.set_positions(unwrapped)
@@ -332,7 +342,11 @@ def _boundary_completion(structure: Structure, tol: float, mult: float = 1.15):
     out_num: list = []
     out_parent: list = []
     seen: set = set()
-    shifts = list(itertools.product((-1, 0, 1), repeat=3))
+    # Only image along periodic axes: a slab/polymer's aperiodic direction carries
+    # CRYSTAL's formal 500 Å vector, and shifting by it would spawn phantom copies
+    # of the whole system 500 Å away in the vacuum.
+    per_axis = [(-1, 0, 1) if p else (0,) for p in atoms.get_pbc()]
+    shifts = list(itertools.product(*per_axis))
     for comp in clusters:
         cluster_pos = base_pos[comp]
         for shift in shifts:
@@ -378,6 +392,57 @@ def complete_boundary(
     return Structure.from_ase(atoms), new_modes
 
 
+def to_analysis_cell(structure: Structure, unit_cell) -> Structure:
+    """Fold a *displayed* structure back into a single unit cell for symmetry work.
+
+    The shown structure may be a supercell and/or boundary-completed, so it can't
+    be handed to a symmetry finder directly: a supercell's box has the wrong shape
+    (spglib would report the box's point group, not the crystal's), and boundary
+    images sit on top of their originals once wrapped. Re-imposing ``unit_cell``
+    and wrapping every atom into it folds the tiles and images back onto their
+    originals; coincident copies are then dropped, leaving one clean cell. Any
+    edits made to the displayed atoms are carried along by the fold.
+
+    A slab's (or polymer's) dimensionality is preserved: only the periodic axes
+    are folded, so the aperiodic 500 Å direction is never wrapped (which would fling
+    atoms across the vacuum) and the system does not silently become 3D.
+
+    Non-periodic structures (and degenerate cells) are returned untouched. Always
+    a fresh copy — never mutates its argument.
+    """
+    if not structure.is_periodic:
+        return Structure.from_ase(structure.to_ase())
+    cell = np.asarray(unit_cell, dtype=float)
+    if cell.shape != (3, 3) or abs(np.linalg.det(cell)) < 1e-8:
+        return Structure.from_ase(structure.to_ase())
+
+    atoms = structure.to_ase()
+    pbc = [bool(p) for p in atoms.get_pbc()]  # keep the original dimensionality
+    atoms.set_cell(cell)
+    frac = atoms.get_scaled_positions(wrap=True)  # wraps periodic axes into [0, 1) only
+    cart = atoms.get_positions()
+    numbers = atoms.get_atomic_numbers()
+    # Tiles and boundary images fold to the *same* fractional site along the periodic
+    # axes (they differ by whole lattice vectors), so a coarse grid key on those axes
+    # dedupes them — the ``% 1.0`` also folds an atom drawn at both the 0 and 1
+    # boundary. An aperiodic axis has no images, so it keys on the raw position to
+    # keep distinct layers (e.g. the sheets of a slab) apart.
+    seen: set = set()
+    keep = []
+    for i in range(len(atoms)):
+        key = [int(numbers[i])]
+        for axis in range(3):
+            if pbc[axis]:
+                key.append(round(float(frac[i][axis]), 3) % 1.0)
+            else:
+                key.append(round(float(cart[i][axis]), 2))
+        key = tuple(key)
+        if key not in seen:
+            seen.add(key)
+            keep.append(i)
+    return Structure.from_ase(atoms[keep])
+
+
 __all__ = [
     "CellView",
     "to_conventional",
@@ -385,4 +450,5 @@ __all__ = [
     "as_view",
     "tile_supercell",
     "complete_boundary",
+    "to_analysis_cell",
 ]

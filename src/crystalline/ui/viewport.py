@@ -18,7 +18,7 @@ from typing import Optional
 
 import numpy as np
 from pyvistaqt import QtInteractor
-from PySide6.QtCore import QEvent, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtWidgets import QWidget, QVBoxLayout
 
 from crystalline.core.structure import Structure
@@ -29,6 +29,11 @@ from crystalline.viz.renderer import StructureRenderer
 # Big enough to see context, small enough that the structure stays findable.
 _MAX_ZOOM_OUT_FACTOR = 6.0
 
+# Arrow-key nudge step (Å): a precise default, and a coarser one with Shift held.
+_NUDGE_STEP = 0.1
+_NUDGE_STEP_COARSE = 0.5
+_ARROW_KEYS = (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down)
+
 
 class Viewport(QWidget):
     """3D view of the current structure: click to select, drag to move atoms."""
@@ -37,6 +42,8 @@ class Viewport(QWidget):
     atom_moved = Signal(int)   # emits the index of a dragged atom (post-commit)
     selection_cleared = Signal()
     interaction_started = Signal()  # an atom drag began (e.g. stop animation)
+    delete_requested = Signal()  # Del/Backspace pressed while the 3D view has focus
+    nudge_requested = Signal(object)  # arrow key: (dx, dy, dz) world vector to move the selection
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -48,6 +55,7 @@ class Viewport(QWidget):
         self.renderer = StructureRenderer(self.interactor)
         self._structure: Optional[Structure] = None
         self._reference_cell: Optional[np.ndarray] = None  # original cell, for axis views
+        self._editing = False  # arrow-key nudging is only live in editing mode
         self.interactor.set_background("white")
 
         self._drag = install_atom_drag(
@@ -66,9 +74,42 @@ class Viewport(QWidget):
         self.interactor.installEventFilter(self)
 
     def eventFilter(self, obj, event) -> bool:
-        if obj is self.interactor and event.type() in (QEvent.Enter, QEvent.FocusIn):
-            self._drag.reactivate()
+        if obj is self.interactor:
+            etype = event.type()
+            if etype in (QEvent.Enter, QEvent.FocusIn):
+                self._drag.reactivate()
+            elif etype == QEvent.KeyPress:
+                key = event.key()
+                if key in (Qt.Key_Delete, Qt.Key_Backspace):
+                    # The embedded VTK widget swallows plain key presses, so the
+                    # Del menu shortcut never fires while the 3D view has focus
+                    # (which it does right after picking an atom). Route it out.
+                    self.delete_requested.emit()
+                    return True  # consume: don't also let VTK act on it
+                if self._editing and key in _ARROW_KEYS:
+                    self.nudge_requested.emit(self._nudge_vector(key, event.modifiers()))
+                    return True  # consume: arrows nudge the selection, not the camera
         return super().eventFilter(obj, event)
+
+    def _nudge_vector(self, key, modifiers) -> np.ndarray:
+        """World-space move for an arrow key, in the screen plane of the camera.
+
+        Left/Right track the camera's horizontal axis and Up/Down its vertical
+        one, so a nudge always goes the way it looks on screen regardless of how
+        the structure is rotated. Shift takes a coarser step.
+        """
+        step = _NUDGE_STEP_COARSE if (modifiers & Qt.ShiftModifier) else _NUDGE_STEP
+        camera = self.interactor.camera
+        view_dir = np.asarray(camera.GetDirectionOfProjection(), dtype=float)
+        up = np.asarray(camera.GetViewUp(), dtype=float)
+        up = up / np.linalg.norm(up)
+        right = np.cross(view_dir, up)
+        right = right / np.linalg.norm(right)
+        direction = {
+            Qt.Key_Right: right, Qt.Key_Left: -right,
+            Qt.Key_Up: up, Qt.Key_Down: -up,
+        }[key]
+        return direction * step
 
     def show_structure(self, structure: Structure, reference_cell=None, bond_structure=None) -> None:
         self._structure = structure
@@ -125,6 +166,31 @@ class Viewport(QWidget):
         self._limit_zoom_out()
         self.interactor.render()
 
+    def set_annotations(self, annotations) -> None:
+        """Draw the Geometry panel's measurements over the structure."""
+        self.renderer.set_annotations(annotations)
+
+    def rotate_view(self, azimuth: float = 0.0, elevation: float = 0.0) -> None:
+        """Orbit the camera around the structure by the given angles (degrees).
+
+        ``azimuth`` turns the crystal left/right about the current up direction,
+        ``elevation`` tips it up/down. The camera keeps its distance, so this is
+        a pure rotation of the view — the counterpart of the a/b/c alignment
+        buttons for looking at the structure from an arbitrary angle. Works with
+        or without a cell.
+        """
+        if self._structure is None:
+            return
+        camera = self.interactor.camera
+        if azimuth:
+            camera.Azimuth(azimuth)
+        if elevation:
+            camera.Elevation(elevation)
+            # Elevation alone skews (and at the poles flips) the up vector.
+            camera.OrthogonalizeViewUp()
+        self._drag.reactivate()
+        self.interactor.render()
+
     def _active_cell(self) -> Optional[np.ndarray]:
         """The cell that defines a/b/c for view alignment (reference cell first)."""
         if self._reference_cell is not None:
@@ -156,6 +222,7 @@ class Viewport(QWidget):
 
     def set_editing_enabled(self, enabled: bool) -> None:
         """Enable/disable drag-to-move (selection and camera stay available)."""
+        self._editing = bool(enabled)  # gates arrow-key nudging
         self._drag.set_editing_enabled(enabled)
         # Toggling from the menu can leave QtInteractor on its default style;
         # make sure our atom-drag style is (re)active so dragging still works.
@@ -180,6 +247,17 @@ class Viewport(QWidget):
     def camera_position(self):
         """The current camera placement (to reproduce this view off-screen)."""
         return self.interactor.camera_position
+
+    @property
+    def camera_state(self):
+        """Full camera snapshot — placement *and* zoom — for off-screen renders.
+
+        ``camera_position`` alone omits the parallel-projection zoom (the camera's
+        parallel scale), so an export that used only it would reframe the structure
+        and change the zoom. This carries the scale (and perspective view angle) too.
+        """
+        camera = self.interactor.camera
+        return (self.interactor.camera_position, camera.GetParallelScale(), camera.GetViewAngle())
 
     # ── drag-controller callbacks ───────────────────────────────────────
     def _commit_move(self, index: int, position: np.ndarray) -> None:

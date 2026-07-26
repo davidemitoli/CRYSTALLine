@@ -10,8 +10,8 @@ from __future__ import annotations
 from typing import Optional
 
 import numpy as np
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QColor, QIcon
+from PySide6.QtCore import QRect, Qt
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -26,9 +26,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QSpinBox,
-    QToolBar,
-    QToolButton,
-    QWidget,
 )
 
 from crystalline.core.cells import (
@@ -37,17 +34,26 @@ from crystalline.core.cells import (
     complete_boundary,
     expand_modes_to_conventional,
     tile_supercell,
+    to_analysis_cell,
 )
 from crystalline.core.phonons import PhononModes
 from crystalline.core.structure import Structure
 from crystalline.core.undo import UndoHistory
 from crystalline.viz.phonon_animator import PhononAnimator
+from crystalline.ui import menus
 from crystalline.ui.viewport import Viewport
 from crystalline.ui.panels.structure_panel import StructurePanel
 from crystalline.ui.panels.phonon_panel import PhononPanel
 from crystalline.ui.panels.info_panel import InfoPanel
 from crystalline.ui.panels.display_settings import DisplayPanel
+from crystalline.ui.panels.geometry_panel import GeometryPanel
 from crystalline.ui.panels.plot_view import PlotPanel
+
+# Geometry of the floating Plots window on the first plot: a fraction of the main
+# window's width (never below the minimum), 4:3, inset from its lower-right corner.
+_PLOT_FLOAT_WIDTH_FRACTION = 0.55
+_PLOT_FLOAT_MIN_WIDTH = 640
+_PLOT_FLOAT_MARGIN = 24
 
 
 class MainWindow(QMainWindow):
@@ -74,6 +80,7 @@ class MainWindow(QMainWindow):
         self._history = UndoHistory()
         self._suppress_undo = False
         self._output_path: Optional[str] = None  # last-loaded CRYSTAL .out, for plots
+        self._output_props: dict = {}  # parsed CRYSTAL-output rows for the Info panel
         self._axis_actions: list = []  # a/b/c view-alignment actions (menu + toolbar)
         self.structure, _, self._unit_cell, self._bond_structure = self._compose_view(
             self._cell_view, self._supercell, None
@@ -110,6 +117,12 @@ class MainWindow(QMainWindow):
         )
         self._display_dock = self._dock("Display", self.display_panel, Qt.LeftDockWidgetArea)
         self.tabifyDockWidget(info_dock, self._display_dock)
+
+        # left dock (tabbed alongside): measurements + atom tools for the selection.
+        self.geometry_panel = GeometryPanel(self.structure, self)
+        self._geometry_dock = self._dock("Geometry", self.geometry_panel, Qt.LeftDockWidgetArea)
+        self.tabifyDockWidget(info_dock, self._geometry_dock)
+
         info_dock.raise_()  # show Info on top by default
         self.display_panel.set_elements(self.structure.numbers)  # initial element swatches
 
@@ -118,6 +131,7 @@ class MainWindow(QMainWindow):
         self.plot_panel = PlotPanel(self)
         self._plot_dock = self._dock("Plots", self.plot_panel, Qt.BottomDockWidgetArea)
         self._plot_dock.hide()
+        self._plot_dock_floated = False  # floated once, on the first plot built
 
         # Bottom-right status indicators. Order matters: permanent widgets stack
         # left-to-right in call order, so counts sit left of the editing badge.
@@ -136,16 +150,19 @@ class MainWindow(QMainWindow):
         self._editing_status.hide()
 
         self._connect_signals()
-        self._build_menu()
+        menus.build_menus(self)
         self._reset_undo()
         self._update_export_actions()
         self._update_status()
+        self._update_import_action()  # match the (possibly non-empty) initial structure
 
     # ── wiring ──────────────────────────────────────────────────────────
     def _on_structure_changed(self, s: Structure) -> None:
         """Model edited: record undo, redraw, and reconcile a running animation."""
         self._capture_undo(s)
         self._update_status()  # atom count may have changed (add/remove)
+        self._update_import_action()  # importing needs a non-empty structure
+        self._refresh_info()  # symmetry/point group may have changed with the edit
         self.viewport.renderer.refresh()
         # Editing the geometry: stop any animation and re-anchor it to the edited
         # geometry (drop the modes if the atom count changed). Passing the new
@@ -204,15 +221,6 @@ class MainWindow(QMainWindow):
         if redo is not None:
             redo.setEnabled(self._history.can_redo())
 
-    def _history_icon(self, theme_name: str, standard_pixmap: str):
-        """An undo/redo icon: the desktop theme's if present, else a Qt fallback."""
-        from PySide6.QtWidgets import QStyle
-
-        icon = QIcon.fromTheme(theme_name)
-        if icon.isNull():
-            icon = self.style().standardIcon(getattr(QStyle.StandardPixmap, standard_pixmap))
-        return icon
-
     def _connect_signals(self) -> None:
         # viewport pick -> update selection (additive with Ctrl/Shift)
         self.viewport.atom_picked.connect(self.structure_panel.select_atom)
@@ -220,6 +228,11 @@ class MainWindow(QMainWindow):
         self.viewport.atom_moved.connect(self._on_atom_moved)
         # clicking empty space in the 3D view -> clear the panel selection
         self.viewport.selection_cleared.connect(self.structure_panel.clear_selection)
+        # Del/Backspace over the 3D view -> delete the selection (the menu's Del
+        # shortcut can't fire while the VTK widget holds keyboard focus)
+        self.viewport.delete_requested.connect(self._delete_selected)
+        # arrow keys over the 3D view (editing mode) -> nudge the selection
+        self.viewport.nudge_requested.connect(self._nudge_selection)
         # starting to drag an atom -> stop any running phonon animation
         self.viewport.interaction_started.connect(self.phonon_panel.stop)
         # the panel owns the selection -> highlight it + refresh the Edit menu
@@ -227,158 +240,30 @@ class MainWindow(QMainWindow):
         # a phonon mode was (de)selected -> refresh the animation-export action
         self.phonon_panel.mode_selected.connect(lambda _row: self._update_export_actions())
 
+        # Geometry panel: the same edit operations as the Edit menu (so undo and
+        # the selection model behave identically), plus measurement overlays.
+        self.geometry_panel.editing_toggled.connect(self._toggle_editing)
+        self.geometry_panel.delete_requested.connect(self._delete_selected)
+        self.geometry_panel.duplicate_requested.connect(self._duplicate_selected)
+        self.geometry_panel.translate_requested.connect(self._translate_selected)
+        self.geometry_panel.set_element_requested.connect(self._set_element_of_selection)
+        self.geometry_panel.add_atom_requested.connect(self._add_atom)
+        self.geometry_panel.annotations_changed.connect(self.viewport.set_annotations)
+
     def _dock(self, title: str, widget, area) -> QDockWidget:
         dock = QDockWidget(title, self)
         dock.setWidget(widget)
         self.addDockWidget(area, dock)
         return dock
 
-    def _build_menu(self) -> None:
-        file_menu = self.menuBar().addMenu("&File")
-
-        open_action = QAction("Open…", self)
-        open_action.setShortcut("Ctrl+O")
-        open_action.triggered.connect(self._open_file)
-        file_menu.addAction(open_action)
-
-        import_action = QAction("Import atoms into structure…", self)
-        import_action.triggered.connect(self._import_atoms)
-        file_menu.addAction(import_action)
-
-        file_menu.addSeparator()
-        save_gui = QAction("Save structure as .gui…", self)
-        save_gui.triggered.connect(self._save_gui)
-        file_menu.addAction(save_gui)
-
-        save_cif = QAction("Save structure as .cif…", self)
-        save_cif.triggered.connect(self._save_cif)
-        file_menu.addAction(save_cif)
-
-        file_menu.addSeparator()
-        export_image = QAction("Export image…", self)
-        export_image.triggered.connect(self._export_image)
-        file_menu.addAction(export_image)
-
-        self._export_anim_action = QAction("Export phonon animation…", self)
-        self._export_anim_action.triggered.connect(self._export_animation)
-        file_menu.addAction(self._export_anim_action)
-
-        self._build_cell_menu()
-        self._build_edit_menu()
-        self._build_view_menu()
-        self._build_plot_menu()
-        self._build_help_menu()
-        self._build_toolbar()
-
-    def _build_help_menu(self) -> None:
-        help_menu = self.menuBar().addMenu("&Help")
-        about_action = QAction("About CRYSTALLine", self)
-        about_action.triggered.connect(self._show_about)
-        help_menu.addAction(about_action)
-
     def _show_about(self) -> None:
-        """A small About dialog showing the logo and version."""
-        from PySide6.QtCore import Qt as _Qt
-        from PySide6.QtGui import QPixmap
-        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QVBoxLayout
-
-        from crystalline.resources import logo_path
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle("About CRYSTALLine")
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(24, 20, 24, 16)
-        layout.setSpacing(12)
-
-        logo = QLabel()
-        logo.setPixmap(QPixmap(logo_path()).scaledToWidth(320, _Qt.SmoothTransformation))
-        logo.setAlignment(_Qt.AlignCenter)
-        layout.addWidget(logo)
-
-        caption = QLabel(
-            "<div style='text-align:center'>"
-            "<b>CRYSTALLine</b><br>"
-            "A desktop viewer &amp; editor for CRYSTAL structures and phonons.<br>"
-            "<span style='color:gray'>Built on CRYSTALClear.<br>"
-            "Developed with the assistance of Claude (Anthropic).</span></div>"
-        )
-        caption.setTextFormat(_Qt.RichText)
-        caption.setAlignment(_Qt.AlignCenter)
-        layout.addWidget(caption)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Close)
-        buttons.rejected.connect(dialog.reject)
-        buttons.accepted.connect(dialog.accept)
-        layout.addWidget(buttons)
-        dialog.exec()
-
-    def _build_toolbar(self) -> None:
-        """Toolbars for the most-used actions: Undo, and a/b/c view alignment."""
-        edit_toolbar = QToolBar("Edit", self)
-        edit_toolbar.addAction(self._undo_action)
-        edit_toolbar.addAction(self._redo_action)
-        self.addToolBar(edit_toolbar)
-
-        view_toolbar = QToolBar("View", self)
-        caption = QLabel("View along")
-        caption.setContentsMargins(8, 0, 6, 0)
-        view_toolbar.addWidget(caption)
-        # Colour the a/b/c chips to match the lattice gizmo (a=red, b=green,
-        # c=blue), so the button and the on-screen axis arrow read as the same.
-        self._axis_buttons: list = []
-        for label, axis, color in (("a", 0, "#d62728"), ("b", 1, "#2ca02c"), ("c", 2, "#1f77b4")):
-            button = QToolButton(self)
-            button.setText(label)
-            button.setToolTip(f"Look down the {label} axis")
-            button.setStyleSheet(_axis_chip_style(color))
-            button.clicked.connect(lambda _checked=False, a=axis: self.viewport.align_view_along(a))
-            view_toolbar.addWidget(button)
-            self._axis_buttons.append(button)
-        view_toolbar.addWidget(self._toolbar_spacer(6))
-        self.addToolBar(view_toolbar)
-        self._update_view_actions()
-
-    @staticmethod
-    def _toolbar_spacer(width: int) -> "QWidget":
-        spacer = QWidget()
-        spacer.setFixedWidth(width)
-        return spacer
+        menus.show_about(self)
 
     def _update_view_actions(self) -> None:
         """Enable a/b/c view alignment only when there's a cell to align to."""
         enabled = self.viewport.can_align_axes()
         for widget in (*self._axis_actions, *getattr(self, "_axis_buttons", [])):
             widget.setEnabled(enabled)
-
-    def _build_plot_menu(self) -> None:
-        """A 'Plot' menu routing CRYSTAL results through CRYSTALClear.plot.
-
-        Output-file plots (IR/Raman/elastic/EOS) read the loaded ``.out``
-        directly; data-file plots (bands/DOS/XRD) open a file dialog. Related
-        entries (the elastic surfaces) go into a submenu. The whole menu is
-        disabled if CRYSTALClear is missing.
-        """
-        from crystalline.crystalio import available_plots, crystalclear_available
-
-        plot_menu = self.menuBar().addMenu("&Plot")
-        self._plot_kinds = available_plots()
-        self._plot_actions: dict = {}
-        submenus: dict = {}
-        for kind in self._plot_kinds:
-            target = plot_menu
-            if kind.group:
-                target = submenus.get(kind.group)
-                if target is None:
-                    target = plot_menu.addMenu(kind.group)
-                    submenus[kind.group] = target
-            action = QAction(kind.label, self)
-            action.triggered.connect(lambda _checked=False, k=kind: self._open_plot(k))
-            target.addAction(action)
-            self._plot_actions[kind.key] = action
-        if not crystalclear_available():
-            plot_menu.setEnabled(False)
-            plot_menu.setTitle("&Plot (CRYSTALClear not installed)")
-        self._update_plot_actions()
 
     def _update_plot_actions(self) -> None:
         """Enable each plot action according to the loaded file.
@@ -412,27 +297,31 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Plot failed", f"Could not create the plot:\n{exc}")
             return
         self.plot_panel.add_figure(figure, kind.label.rstrip("… "))
-        # Reveal (and raise) the dock so the freshly-built plot is visible,
-        # giving it a generous default height so the plot isn't cramped.
-        first_reveal = self._plot_dock.isHidden()
+        self._reveal_plot_dock()
+
+    def _reveal_plot_dock(self) -> None:
+        """Show the Plots dock — floating, the first time a plot is built.
+
+        Docked at the bottom of the main window, a plot gets a wide, short strip:
+        the worst shape for a figure that wants to be roughly square (polar
+        elastic sections, elastic surfaces, XRD). So the first plot pops the dock
+        out into a free-floating window sized 4:3 beside the main window.
+
+        It stays a dock, not a separate window class: drag it back to re-attach.
+        Whatever the user settles on is then left alone — the float happens once,
+        not on every plot.
+        """
+        if not self._plot_dock_floated:
+            self._plot_dock_floated = True
+            self._plot_dock.setFloating(True)
+            self._plot_dock.show()
+            screen = self.screen()
+            where = _floating_plot_geometry(
+                self.frameGeometry(), screen.availableGeometry() if screen else None
+            )
+            self._plot_dock.setGeometry(where)
         self._plot_dock.show()
         self._plot_dock.raise_()
-        if first_reveal:
-            self.resizeDocks([self._plot_dock], [max(360, self.height() // 3)], Qt.Vertical)
-
-    def _build_view_menu(self) -> None:
-        """A 'View' menu: show the display panel and align the view to an axis."""
-        view_menu = self.menuBar().addMenu("&View")
-        display_action = QAction("Display settings", self)
-        display_action.triggered.connect(self._show_display_panel)
-        view_menu.addAction(display_action)
-
-        view_menu.addSeparator()
-        for label, axis in (("Along a axis", 0), ("Along b axis", 1), ("Along c axis", 2)):
-            action = QAction(label, self)
-            action.triggered.connect(lambda _checked=False, a=axis: self.viewport.align_view_along(a))
-            view_menu.addAction(action)
-            self._axis_actions.append(action)
 
     def _show_display_panel(self) -> None:
         """Reveal and raise the (dockable) display-settings panel."""
@@ -442,75 +331,31 @@ class MainWindow(QMainWindow):
     def _apply_render_settings(self, settings) -> None:
         self.viewport.renderer.set_settings(settings)
 
-    def _build_edit_menu(self) -> None:
-        """An 'Edit' menu: turn editing on, select atoms, and run edit tools."""
-        edit_menu = self.menuBar().addMenu("&Edit")
-
-        self._undo_action = QAction(self._history_icon("edit-undo", "SP_ArrowBack"), "Undo", self)
-        self._undo_action.setShortcut("Ctrl+Z")
-        self._undo_action.setToolTip("Undo (Ctrl+Z)")
-        self._undo_action.triggered.connect(self._undo)
-        self._undo_action.setEnabled(False)
-        edit_menu.addAction(self._undo_action)
-
-        self._redo_action = QAction(self._history_icon("edit-redo", "SP_ArrowForward"), "Redo", self)
-        self._redo_action.setShortcuts(["Ctrl+Shift+Z", "Ctrl+Y"])
-        self._redo_action.setToolTip("Redo (Ctrl+Shift+Z)")
-        self._redo_action.triggered.connect(self._redo)
-        self._redo_action.setEnabled(False)
-        edit_menu.addAction(self._redo_action)
-        edit_menu.addSeparator()
-
-        self._edit_mode_action = QAction("Editing mode", self, checkable=True)
-        self._edit_mode_action.setShortcut("Ctrl+E")
-        self._edit_mode_action.toggled.connect(self._set_editing)
-        edit_menu.addAction(self._edit_mode_action)
-
-        edit_menu.addSeparator()
-        for text, slot, shortcut in (
-            ("Select all", self._select_all, "Ctrl+A"),
-            ("Clear selection", self._clear_selection, None),
-            ("Invert selection", self._invert_selection, None),
-        ):
-            action = QAction(text, self)
-            if shortcut:
-                action.setShortcut(shortcut)
-            action.triggered.connect(slot)
-            edit_menu.addAction(action)
-
-        edit_menu.addSeparator()
-        # These act on the current selection and only while editing is on.
-        self._edit_tool_actions = []
-        for text, slot, shortcut in (
-            ("Delete selected", self._delete_selected, "Del"),
-            ("Duplicate selected", self._duplicate_selected, "Ctrl+D"),
-            ("Translate selected…", self._translate_selected, None),
-            ("Set element of selected…", self._set_element_selected, None),
-        ):
-            action = QAction(text, self)
-            if shortcut:
-                action.setShortcut(shortcut)
-            action.triggered.connect(slot)
-            edit_menu.addAction(action)
-            self._edit_tool_actions.append(action)
-
-        edit_menu.addSeparator()
-        restore_action = QAction("Restore geometry", self)
-        restore_action.setShortcut("Ctrl+R")
-        restore_action.triggered.connect(self._restore_geometry)
-        edit_menu.addAction(restore_action)
-        self._update_edit_actions()
-
     def _restore_geometry(self) -> None:
         """Discard in-app edits and rebuild the originally-loaded geometry."""
         self.structure_panel.clear_selection()
         self._apply_cell_view()  # re-derives from the pristine source
 
     # ── editing: mode, selection, tools ─────────────────────────────────
+    def _toggle_editing(self, enabled: bool) -> None:
+        """Route the Geometry panel's checkbox through the Edit-menu action.
+
+        Going via the action keeps the menu's tick, the status badge and the
+        panel in step whichever one the user clicked. Guarded with ``getattr``
+        because signals are connected before the menus are built, and skipped
+        when already in the requested state so the two can't ping-pong.
+        """
+        action = getattr(self, "_edit_mode_action", None)
+        if action is None:
+            self._set_editing(enabled)  # no menu yet: apply it directly
+        elif action.isChecked() != bool(enabled):
+            action.setChecked(bool(enabled))  # -> toggled -> _set_editing
+
     def _set_editing(self, enabled: bool) -> None:
         self._editing = bool(enabled)
         self.viewport.set_editing_enabled(self._editing)
         self.structure_panel.set_editing_enabled(self._editing)
+        self.geometry_panel.set_editing_enabled(self._editing)
         self._editing_status.setVisible(self._editing)  # bottom-right indicator
         self._update_edit_actions()
 
@@ -522,8 +367,15 @@ class MainWindow(QMainWindow):
 
     def _on_selection_changed(self, indices) -> None:
         self.viewport.set_selection(indices)
+        self.geometry_panel.set_selection(indices)  # drives what can be measured
         self._update_edit_actions()
         self._update_status()
+
+    def _update_import_action(self) -> None:
+        """Enable 'Import atoms' only once there's a structure to import into."""
+        action = getattr(self, "_import_action", None)
+        if action is not None:
+            action.setEnabled(len(self.structure) > 0)
 
     def _update_status(self) -> None:
         """Refresh the bottom-right indicators: atom count, selection, cell view."""
@@ -580,17 +432,57 @@ class MainWindow(QMainWindow):
         if vector is not None:
             self.structure.translate_atoms(indices, vector)
 
-    def _set_element_selected(self) -> None:
+    def _nudge_selection(self, vector) -> None:
+        """Move the selection by ``vector`` (an arrow-key step in the view plane)."""
         indices = self.structure_panel.selected_indices()
         if not self._editing or not indices:
             return
+        self.structure.translate_atoms(indices, vector)  # -> undo + redraw
+        # The redraw rebuilds the scene and drops the selection halos; the
+        # selection itself is unchanged, so re-apply them to keep it visible.
+        self.viewport.set_selection(indices)
+
+    def _set_element_selected(self) -> None:
+        """Edit-menu route: ask for the symbol, then apply it to the selection."""
+        if not self._editing or not self.structure_panel.selected_indices():
+            return
         symbol, ok = QInputDialog.getText(self, "Set element", "Element symbol:")
-        if not ok or not symbol.strip():
+        if ok and symbol.strip():
+            self._set_element_of_selection(symbol)
+
+    def _set_element_of_selection(self, symbol: str) -> None:
+        """Re-element the selection (the Geometry panel supplies the symbol)."""
+        indices = self.structure_panel.selected_indices()
+        if not self._editing or not indices or not symbol.strip():
             return
         try:
             self.structure.set_symbols(indices, symbol.strip())
         except ValueError:
             QMessageBox.warning(self, "Unknown element", f"'{symbol}' is not a known element.")
+
+    def _add_atom(self, symbol: str) -> None:
+        """Add one atom of ``symbol`` at the centre of the cell, and select it.
+
+        The centre is the obvious place to drop an atom you are about to drag
+        into position: inside the cell and away from the boundary. For a
+        non-periodic system it lands on the structure's centroid.
+        """
+        if not self._editing or not symbol.strip():
+            return
+        try:
+            index = self.structure.add_atom(symbol.strip(), self._new_atom_position())
+        except ValueError:
+            QMessageBox.warning(self, "Unknown element", f"'{symbol}' is not a known element.")
+            return
+        self.structure_panel.set_selection([index])  # ready to drag / translate
+
+    def _new_atom_position(self) -> list:
+        cell = np.asarray(self.structure.cell, dtype=float)
+        if self.structure.is_periodic and not np.allclose(cell, 0.0):
+            return list(0.5 * cell.sum(axis=0))
+        if len(self.structure):
+            return list(np.asarray(self.structure.positions, dtype=float).mean(axis=0))
+        return [0.0, 0.0, 0.0]
 
     def _ask_vector(self):
         """Small dialog returning a cartesian (dx, dy, dz) shift, or None."""
@@ -612,26 +504,6 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.Accepted:
             return None
         return [box.value() for box in boxes]
-
-    def _build_cell_menu(self) -> None:
-        """A 'Cell' menu: supercell and boundary-completion of the crystallographic cell."""
-        cell_menu = self.menuBar().addMenu("&Cell")
-
-        self._lattice_action = QAction("Lattice parameters…", self)
-        self._lattice_action.triggered.connect(self._open_lattice_dialog)
-        cell_menu.addAction(self._lattice_action)
-
-        self._supercell_action = QAction("Supercell…", self)
-        self._supercell_action.triggered.connect(self._open_supercell_dialog)
-        cell_menu.addAction(self._supercell_action)
-
-        # Show whole molecules/atoms that only partially belong to the cell
-        # (their periodic images poke in) — the "packed" view, on by default.
-        # Unchecking restricts the view to the cell's own atoms.
-        self._boundary_action = QAction("Complete molecules at cell boundary", self, checkable=True)
-        self._boundary_action.setChecked(self._show_boundary)
-        self._boundary_action.toggled.connect(self._on_boundary_toggled)
-        cell_menu.addAction(self._boundary_action)
 
     def _on_boundary_toggled(self, enabled: bool) -> None:
         self._show_boundary = bool(enabled)
@@ -684,7 +556,7 @@ class MainWindow(QMainWindow):
             return
         self._source.set_lattice_parameters(*(box.value() for box in boxes))
         self._apply_cell_view()
-        self.info_panel.show_structure(self._source)
+        self.info_panel.show_structure(self._source, self._output_props)
 
     def _open_supercell_dialog(self) -> None:
         """Prompt for the na × nb × nc repetitions and rebuild the view.
@@ -709,17 +581,25 @@ class MainWindow(QMainWindow):
 
         if dialog.exec() != QDialog.Accepted:
             return
-        self._supercell = tuple(box.value() for box in boxes)
-        na, nb, nc = self._supercell
-        suffix = "" if self._supercell == (1, 1, 1) else f"  ({na}×{nb}×{nc})"
-        self._supercell_action.setText(f"Supercell…{suffix}")
+        self._set_supercell(tuple(box.value() for box in boxes))
         self._apply_cell_view()
+
+    def _set_supercell(self, reps) -> None:
+        """Record the supercell tiling and keep the menu action's label in step."""
+        self._supercell = tuple(reps)
+        action = getattr(self, "_supercell_action", None)
+        if action is not None:
+            na, nb, nc = self._supercell
+            suffix = "" if self._supercell == (1, 1, 1) else f"  ({na}×{nb}×{nc})"
+            action.setText(f"Supercell…{suffix}")
 
     # ── file actions ────────────────────────────────────────────────────
     def _open_file(self) -> None:
         """Single open: loads geometry, and phonon modes too if the file has them."""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open CRYSTAL file", "", "CRYSTAL files (*.out *.gui *.34);;All files (*)"
+            self, "Open structure file", "",
+            "Structure files (*.out *.gui *.34 *.cif);;CRYSTAL files (*.out *.gui *.34);;"
+            "CIF files (*.cif);;All files (*)",
         )
         if not path:
             return
@@ -732,12 +612,14 @@ class MainWindow(QMainWindow):
             return
         self._source = result.structure
         self._modes = result.modes if result.has_phonons else None
+        self._set_supercell((1, 1, 1))  # a fresh file starts at its own unit cell
         # Remember the output file so property plots (IR/Raman/elastic/EOS) can
-        # read it directly; geometry-only files (.gui/.34) carry no such data.
-        self._output_path = None if path.lower().endswith((".gui", ".34")) else path
+        # read it directly; geometry-only files (.gui/.34/.cif) carry no such data.
+        self._output_path = None if path.lower().endswith((".gui", ".34", ".cif")) else path
         self._apply_cell_view()
         self._update_info(path)
         self._update_plot_actions()  # enable only the plots this file supports
+        self._update_import_action()  # a structure is now loaded — allow importing
 
     def _import_atoms(self) -> None:
         """Read atoms from an .xyz/.pdb/.cif file and add them to the current structure.
@@ -783,11 +665,28 @@ class MainWindow(QMainWindow):
             props = output_properties(path)
         except Exception:  # noqa: BLE001 - never let output parsing break loading
             props = {}
-        self.info_panel.show_structure(self._source, props)
+        self._output_props = props or {}
+        self.info_panel.show_structure(self._source, self._output_props)
+
+    def _refresh_info(self) -> None:
+        """Re-analyse the shown structure so the Info panel tracks geometry edits.
+
+        The displayed structure may be a supercell or boundary-completed, neither
+        of which a symmetry finder can read directly, so it's folded back into the
+        original unit cell first (see :func:`to_analysis_cell`). The CRYSTAL-output
+        rows are carried over unchanged — they describe the loaded file, not the
+        live geometry. Never let this abort an edit: it runs before the viewport
+        redraws, so a symmetry-analysis hiccup must not swallow the redraw.
+        """
+        try:
+            analysis = to_analysis_cell(self.structure, self._unit_cell)
+            self.info_panel.show_structure(analysis, self._output_props)
+        except Exception:  # noqa: BLE001 - info is advisory; never break the edit
+            pass
 
     def _save_gui(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save CRYSTAL .gui", "", "CRYSTAL gui (*.gui)"
+            self, "Save CRYSTAL .gui", "structure.gui", "CRYSTAL gui (*.gui)"
         )
         if not path:
             return
@@ -795,8 +694,8 @@ class MainWindow(QMainWindow):
             from crystalline.crystalio import save_structure_gui
 
             save_structure_gui(self.structure, path)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Save failed", str(exc))
+        except Exception as exc:  # noqa: BLE001 - surface any write error to the user
+            self._report_save_error(".gui file", exc)
 
     def _save_cif(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Save CIF", "structure.cif", "CIF (*.cif)")
@@ -807,7 +706,34 @@ class MainWindow(QMainWindow):
 
             save_structure_cif(self.structure, path)
         except Exception as exc:  # noqa: BLE001 - surface any write error to the user
-            QMessageBox.critical(self, "Save failed", f"Could not save the CIF:\n{exc}")
+            self._report_save_error("CIF", exc)
+
+    def _build_crystal_input(self) -> None:
+        """Open the CRYSTAL ``.d12`` input builder for the current unit cell.
+
+        Uses ``_source`` (the pristine loaded cell), not the displayed structure,
+        so symmetry reduction sees the real unit cell rather than a supercell
+        tiling or boundary-completed duplicates.
+        """
+        if len(self._source) == 0:
+            QMessageBox.information(
+                self, "Build CRYSTAL input", "Open or build a structure first."
+            )
+            return
+        from crystalline.ui.panels.input_builder import InputBuilderDialog
+
+        InputBuilderDialog(self._source, self).exec()
+
+    def _report_save_error(self, what: str, exc: BaseException) -> None:
+        """Tell the user a save failed — never with an empty dialog.
+
+        pymatgen's symmetry errors (``SymmetryUndeterminedError``) carry no
+        message at all, which used to render as a blank message box; fall back
+        to the exception's type name so there is always something to report.
+        """
+        QMessageBox.critical(
+            self, "Save failed", f"Could not save the {what}:\n{exc or type(exc).__name__}"
+        )
 
     # ── export (image / animation) ──────────────────────────────────────
     def _export_image(self) -> None:
@@ -917,7 +843,7 @@ class MainWindow(QMainWindow):
                 n_frames=n_frames,
                 reference_cell=self._unit_cell,
                 bond_structure=self._bond_structure,
-                camera=self.viewport.camera_position,
+                camera=self.viewport.camera_state,  # placement + zoom (parallel scale)
                 window_size=window_size,
             )
             written = save_animation(frames, path, fps=fps)
@@ -1059,38 +985,49 @@ class MainWindow(QMainWindow):
         We rebind rather than recreate widgets so loading a file (or a view
         change) doesn't spawn duplicate docks (and keeps signals intact).
         ``unit_cell`` outlines the original cell; ``bond_structure`` is the clean
-        cell used for the bond/polyhedra coordination analysis.
+        cell used for the bond/polyhedra coordination analysis. Both are also kept
+        on the window for later re-derives (animation export, symmetry re-analysis
+        of edits), so they must track the structure being shown.
         """
         self.structure = new
+        if unit_cell is not None:
+            self._unit_cell = unit_cell
+        if bond_structure is not None:
+            self._bond_structure = bond_structure
         self.structure.add_listener(self._on_structure_changed)
         self.viewport.show_structure(
             self.structure, reference_cell=unit_cell, bond_structure=bond_structure
         )
         self.structure_panel.set_structure(self.structure)
+        if hasattr(self, "geometry_panel"):
+            self.geometry_panel.set_structure(self.structure)
         self._reset_undo()  # edits (and their undo history) don't cross a re-derive
         self._update_view_actions()  # a/b/c alignment depends on the cell just shown
         if hasattr(self, "display_panel"):
             self.display_panel.set_elements(self.structure.numbers)  # refresh element swatches
 
 
-def _axis_chip_style(color: str) -> str:
-    """Qt stylesheet for a rounded, coloured a/b/c axis button (with states)."""
-    hover = QColor(color).lighter(115).name()
-    pressed = QColor(color).darker(110).name()
-    return f"""
-        QToolButton {{
-            background-color: {color};
-            color: white;
-            font-weight: bold;
-            border: none;
-            border-radius: 4px;
-            padding: 4px 11px;
-            margin: 2px 1px;
-        }}
-        QToolButton:hover {{ background-color: {hover}; }}
-        QToolButton:pressed {{ background-color: {pressed}; }}
-        QToolButton:disabled {{ background-color: #cccccc; color: #f0f0f0; }}
+def _floating_plot_geometry(window: QRect, screen: Optional[QRect]) -> QRect:
+    """Where the floating Plots window should sit, given the main window's frame.
+
+    A 4:3 panel — matplotlib's own default figure ratio, so axes get room in both
+    directions instead of the letterbox a bottom dock imposes — sized against the
+    main window and tucked towards its lower right so the 3D view stays visible.
+    Clamped to ``screen`` (when known) so it can't open partly off-display.
     """
+    width = max(_PLOT_FLOAT_MIN_WIDTH, int(window.width() * _PLOT_FLOAT_WIDTH_FRACTION))
+    height = int(round(width * 3 / 4))
+    if screen is not None and not screen.isEmpty():
+        width = min(width, screen.width())
+        height = min(height, screen.height())
+
+    margin = _PLOT_FLOAT_MARGIN
+    x = window.x() + max(margin, window.width() - width - margin)
+    y = window.y() + max(margin, window.height() - height - margin)
+    if screen is not None and not screen.isEmpty():
+        x = min(max(x, screen.x()), screen.right() - width + 1)
+        y = min(max(y, screen.y()), screen.bottom() - height + 1)
+    return QRect(x, y, width, height)
 
 
 __all__ = ["MainWindow"]

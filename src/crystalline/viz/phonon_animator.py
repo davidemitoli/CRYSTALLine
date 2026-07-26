@@ -23,9 +23,15 @@ class PhononAnimator:
         self.amplitude: float = 0.5
 
     def set_mode(self, equilibrium: np.ndarray, mode: PhononMode) -> None:
-        """Select the mode to animate around a fixed equilibrium geometry."""
+        """Select the mode to animate around a fixed equilibrium geometry.
+
+        The equilibrium also becomes the renderer's bond reference, so the bond
+        network stays the one the molecule actually has instead of being
+        re-derived from each displaced frame — which broke up at large amplitude.
+        """
         self._equilibrium = np.asarray(equilibrium, dtype=float)
         self._mode = mode
+        self.renderer.set_bond_reference(self._equilibrium)
 
     def set_frame(self, phase: float) -> None:
         """Render one frame at animation ``phase`` (radians)."""
@@ -35,7 +41,8 @@ class PhononAnimator:
         self.renderer.update_positions(pos)
 
     def reset(self) -> None:
-        """Return atoms to their equilibrium positions."""
+        """Return atoms to their equilibrium positions and re-enable live bonding."""
+        self.renderer.set_bond_reference(None)
         if self._matches_renderer():
             self.renderer.update_positions(self._equilibrium)
 

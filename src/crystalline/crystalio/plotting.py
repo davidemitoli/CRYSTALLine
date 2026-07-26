@@ -142,6 +142,40 @@ def _elastic_builder(choose: str, ndeg: int = 100) -> Callable[[str], object]:
     return build
 
 
+def _elastic_2d_builder(choose: str, ndeg: int = 200) -> Callable[[str], object]:
+    """Elastic polar sections through the xy/xz/yz planes (the 2D analogue).
+
+    Same properties as the 3D surfaces, drawn as one polar figure overlaying the
+    three principal planes. Needs a CRYSTALClear providing ``plot_cry_ela_2D``
+    (see :func:`_has_plot_function`), which is why the menu entries are
+    registered conditionally.
+    """
+
+    def build(path: str):
+        CCplt = _plot_module()
+        from CRYSTALClear.crystal_io import Crystal_output
+
+        co = Crystal_output(path)
+        co.get_elatensor()
+        return _to_figure(CCplt.plot_cry_ela_2D(co, choose, ndeg))
+
+    return build
+
+
+def _has_plot_function(name: str) -> bool:
+    """Whether the installed CRYSTALClear exposes ``plot.<name>``.
+
+    Lets the menu offer plots that only newer CRYSTALClear builds provide,
+    without breaking against one that doesn't have them — a missing function
+    simply means the entry isn't listed.
+    """
+    try:
+        from CRYSTALClear import plot as CCplt
+    except Exception:  # noqa: BLE001 - CRYSTALClear missing/broken: no extras
+        return False
+    return hasattr(CCplt, name)
+
+
 def _eos_builder() -> Callable[[str], object]:
     """Equation-of-state E(V) fit from an EOS run."""
 
@@ -197,6 +231,10 @@ def available_plots() -> List[PlotKind]:
 
     Output-file plots (IR/Raman/elastic/EOS) read the loaded ``.out`` directly;
     data-file plots (bands/DOS/XRD) prompt for the matching PROPERTIES file.
+
+    The 2D elastic sections are listed only when the installed CRYSTALClear can
+    draw them (it needs ``plot_cry_ela_2D``), so an older build just shows the
+    3D surfaces instead of offering menu entries that would fail.
     """
     return [
         # ── from the CRYSTAL output file ──
@@ -218,6 +256,7 @@ def available_plots() -> List[PlotKind]:
         PlotKind("ela_poisson", "Poisson's ratio (avg)", "output", "Open CRYSTAL output (.out)", _OUT,
                  _elastic_builder("poisson avg"), group="Elastic properties",
                  probe=("get_elatensor", "elatensor")),
+        *_elastic_2d_plots(),
         PlotKind("eos", "Equation of state", "output", "Open CRYSTAL output (.out)", _OUT,
                  _eos_builder(), probe=("get_EOS", "VvsE")),
         # ── from a PROPERTIES / dispersion data file ──
@@ -236,6 +275,33 @@ def available_plots() -> List[PlotKind]:
         PlotKind("xrd", "Simulated XRD pattern…", "data",
                  "Open XRD spectrum (XRDATO.DAT)", _DAT,
                  _prop_builder("read_cry_xrd_spec", "plot_cry_xrd")),
+    ]
+
+
+_ELASTIC_2D_GROUP = "Elastic properties (2D)"
+
+
+def _elastic_2d_plots() -> List[PlotKind]:
+    """The 2D elastic sections, or nothing if CRYSTALClear can't draw them.
+
+    Mirrors the four 3D surfaces so the two submenus read the same way; the
+    ``choose`` strings are exactly those ``plot_cry_ela_2D`` accepts.
+    """
+    if not _has_plot_function("plot_cry_ela_2D"):
+        return []
+    probe = ("get_elatensor", "elatensor")
+    return [
+        PlotKind("ela2d_young", "Young's modulus", "output", "Open CRYSTAL output (.out)", _OUT,
+                 _elastic_2d_builder("young"), group=_ELASTIC_2D_GROUP, probe=probe),
+        PlotKind("ela2d_comp", "Linear compressibility", "output",
+                 "Open CRYSTAL output (.out)", _OUT,
+                 _elastic_2d_builder("comp"), group=_ELASTIC_2D_GROUP, probe=probe),
+        PlotKind("ela2d_shear", "Shear modulus (avg)", "output",
+                 "Open CRYSTAL output (.out)", _OUT,
+                 _elastic_2d_builder("shear avg"), group=_ELASTIC_2D_GROUP, probe=probe),
+        PlotKind("ela2d_poisson", "Poisson's ratio (avg)", "output",
+                 "Open CRYSTAL output (.out)", _OUT,
+                 _elastic_2d_builder("poisson avg"), group=_ELASTIC_2D_GROUP, probe=probe),
     ]
 
 
