@@ -3,8 +3,8 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "crystalline"
-version = "0.1.1"
+name = "CRYSTALLine"
+version = "0.1.2"
 description = "A desktop GUI for building/editing CRYSTAL structures and visualising vibrational modes, built on CRYSTALClear."
 readme = "README.md"
 requires-python = ">=3.9"
