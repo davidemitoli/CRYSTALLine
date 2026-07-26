@@ -13,6 +13,7 @@ from crystalline.core.cells import (
     complete_boundary,
     expand_modes_to_conventional,
     tile_supercell,
+    to_analysis_cell,
     to_conventional,
 )
 from crystalline.core.phonons import PhononMode, PhononModes
@@ -178,6 +179,43 @@ def test_boundary_completion_adds_partial_molecules():
     assert frac.min() < 0.0 and frac.max() > 1.0  # atoms poke outside the box
 
 
+def test_conventional_keeps_a_centred_slab_in_one_piece():
+    """Regression: a slab centred on z = 0 must not be split into two sheets
+    ~500 Å apart. Wrapping into the cell box may only touch the periodic axes —
+    wrapping the formal 500 Å aperiodic axis flung negative-z atoms to z ≈ 500."""
+    from ase.build import fcc111
+
+    at = fcc111("Pt", size=(1, 1, 4), vacuum=0.0)
+    at.translate([0, 0, -at.get_positions()[:, 2].mean()])  # centre at z = 0, as CRYSTAL does
+    cell = np.asarray(at.get_cell(), dtype=float)
+    cell[2] = [0.0, 0.0, 500.0]
+    at.set_cell(cell)
+    at.set_pbc((True, True, False))
+
+    conv = to_conventional(Structure.from_ase(at))
+    thickness = np.ptp(conv.positions[:, 2])
+    assert thickness < 20.0  # the whole slab stays together (real thickness ~7 Å)
+
+
+def test_boundary_completion_never_images_along_aperiodic_axis():
+    """A slab must not spawn phantom copies 500 Å away in the vacuum: boundary
+    completion may only image along the periodic (in-plane) axes."""
+    from ase.build import fcc111
+
+    at = fcc111("Pt", size=(1, 1, 3), vacuum=0.0)
+    cell = np.asarray(at.get_cell(), dtype=float)
+    cell[2] = [0.0, 0.0, 500.0]  # CRYSTAL's aperiodic placeholder
+    at.set_cell(cell)
+    at.set_pbc((True, True, False))
+    slab = Structure.from_ase(at)
+
+    packed, _ = complete_boundary(slab)
+    # every completed atom stays with the slab, never at z ≈ 500
+    assert packed.positions[:, 2].max() < 10.0
+    original_zmax = slab.positions[:, 2].max()
+    assert packed.positions[:, 2].max() <= original_zmax + 1e-6
+
+
 def test_boundary_completion_replicates_modes():
     dry = to_conventional(_dry_ice())
     evec = np.arange(len(dry) * 3, dtype=float).reshape(len(dry), 3)
@@ -200,3 +238,49 @@ def test_supercell_identity_and_molecule_are_noops():
     mol.add_atom("H", [0.96, 0.0, 0.0])
     tiled, _ = tile_supercell(mol, (3, 3, 3))
     assert len(tiled) == 2  # a non-periodic system is never tiled
+
+
+def test_to_analysis_cell_folds_supercell_and_boundary_back():
+    """A displayed (tiled + boundary-completed) cell folds back to one clean cell.
+
+    The shown structure is unusable for symmetry analysis directly — a supercell
+    box has the wrong shape and boundary images overlap their originals — so the
+    Info panel folds it back into the original unit cell before analysing.
+    """
+    from crystalline.core.crystallography import analyze
+
+    base = as_view(Structure.from_ase(bulk("NaCl", "rocksalt", a=5.64)), CellView.CRYSTALLOGRAPHIC)
+    unit_cell = base.to_ase().get_cell()
+
+    analysis, _ = tile_supercell(base, (2, 2, 2))
+    shown, _ = complete_boundary(analysis)
+    assert len(shown) > len(base)  # tiling + images inflate the shown atom count
+
+    folded = to_analysis_cell(shown, unit_cell)
+    assert len(folded) == len(base)  # collapsed back to a single unit cell
+    # and the fold recovers the crystal's true point group (m-3m), which neither
+    # the supercell (wrong box) nor the boundary-completed cell (overlaps) yields.
+    assert analyze(folded).point_group == analyze(base).point_group == "m-3m"
+
+
+def test_to_analysis_cell_carries_edits_and_lowers_symmetry():
+    """An edit made on the shown structure survives the fold and changes symmetry."""
+    from crystalline.core.crystallography import analyze
+
+    base = as_view(Structure.from_ase(bulk("NaCl", "rocksalt", a=5.64)), CellView.CRYSTALLOGRAPHIC)
+    unit_cell = base.to_ase().get_cell()
+
+    shown, _ = complete_boundary(*tile_supercell(base, (1, 1, 1)))
+    edited = Structure.from_ase(shown.to_ase())
+    edited.translate_atoms([0], [0.4, 0.0, 0.0])  # nudge one atom off its site
+
+    folded = to_analysis_cell(edited, unit_cell)
+    assert analyze(folded).point_group != "m-3m"  # symmetry dropped from cubic
+
+
+def test_to_analysis_cell_passes_molecules_through():
+    mol = Structure.empty()
+    mol.add_atom("O", [0.0, 0.0, 0.0])
+    mol.add_atom("H", [0.96, 0.0, 0.0])
+    out = to_analysis_cell(mol, np.zeros((3, 3)))  # degenerate cell, non-periodic
+    assert len(out) == 2

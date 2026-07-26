@@ -71,25 +71,28 @@ def load(path: str, initial: bool = False) -> LoadedFile:
     This is the single entry point the GUI uses: it returns the structure and,
     if the output is a frequency calculation, the phonon modes as well.
     """
-    if not _is_gui(path) and has_phonons(path):
+    if not _is_gui(path) and not _is_cif(path) and has_phonons(path):
         structure, modes = load_phonons(path)
         return LoadedFile(structure=structure, modes=modes)
     return LoadedFile(structure=load_structure(path, initial=initial), modes=None)
 
 
 def load_structure(path: str, initial: bool = False) -> Structure:
-    """Load a structure from a CRYSTAL ``.out`` or ``.gui`` file.
+    """Load a structure from a CRYSTAL ``.out``/``.gui`` file or a ``.cif``.
 
     Parameters
     ----------
     path:
-        Path to a ``.out`` output file or a ``.gui``/``fort.34`` geometry file.
+        A CRYSTAL ``.out`` output, a ``.gui``/``fort.34`` geometry file, or a
+        crystallographic ``.cif``.
     initial:
         For ``.out`` files, read the initial geometry instead of the last one
-        (relevant after a geometry optimisation). Ignored for ``.gui`` files.
+        (relevant after a geometry optimisation). Ignored for ``.gui``/``.cif``.
     """
     if _is_gui(path):
         return Structure.from_ase(_gui_to_ase(path))
+    if _is_cif(path):
+        return Structure.from_ase(_cif_to_ase(path))
     return Structure.from_ase(_out_to_ase(path, initial=initial))
 
 
@@ -141,12 +144,30 @@ def load_phonons(
 
 
 def save_structure_gui(structure: Structure, gui_file: str, symmetry: bool = True) -> None:
-    """Write a :class:`Structure` to a CRYSTAL ``.gui`` file."""
-    from pymatgen.io.ase import AseAtomsAdaptor
+    """Write a :class:`Structure` to a CRYSTAL ``.gui`` file.
+
+    A periodic cell is written at its own dimensionality (3D bulk / 2D slab /
+    1D polymer); a non-periodic one becomes a 0D (molecule) gui. If symmetry
+    can't be determined, a ``P1`` gui is written rather than failing the save.
+
+    ``pbc`` is always passed explicitly: left to itself, ``cry_pmg2gui``
+    round-trips a molecule through ``Molecule(species, coords, charge,
+    site_properties)`` — positional arguments that no longer line up with
+    current pymatgen, so it raises.
+    """
     from CRYSTALClear.convert import cry_pmg2gui  # qualified path: safe
 
-    pmg = AseAtomsAdaptor().get_structure(structure.to_ase())
-    cry_pmg2gui(pmg, gui_file=gui_file, symmetry=symmetry)
+    if _has_lattice(structure):
+        obj = _to_pymatgen(structure)
+        pbc = tuple(bool(p) for p in structure.pbc)
+    else:
+        obj = _to_pymatgen_molecule(structure)
+        pbc = (False, False, False)
+
+    try:
+        cry_pmg2gui(obj, gui_file=gui_file, pbc=pbc, symmetry=symmetry)
+    except Exception:  # noqa: BLE001 - symmetry undeterminable: write an unreduced P1 gui
+        cry_pmg2gui(obj, gui_file=gui_file, pbc=pbc, symmetry=False)
 
 
 def save_structure_cif(structure: Structure, cif_file: str, symmetry: bool = True) -> None:
@@ -156,29 +177,18 @@ def save_structure_cif(structure: Structure, cif_file: str, symmetry: bool = Tru
     detects the space group (``symprec`` search) and writes the symmetry-reduced
     CIF, otherwise a plain ``P1`` listing. A non-periodic system (a molecule)
     has no lattice for a crystallographic CIF, so it falls back to ASE's writer.
-
-    The structure handed in is the *displayed* cell, which may be "packed"
-    (boundary atoms duplicated as periodic images). Those coincident sites are
-    merged first — otherwise pymatgen's symmetry finder raises on the duplicates.
-    If symmetry still can't be determined, a ``P1`` CIF is written rather than
-    failing the save.
+    If symmetry can't be determined, a ``P1`` CIF is written rather than failing
+    the save.
     """
-    atoms = structure.to_ase()
-    if not (structure.is_periodic and not np.allclose(np.asarray(atoms.cell), 0.0)):
+    if not _has_lattice(structure):
         from ase.io import write  # non-periodic: no lattice for a crystallographic CIF
 
-        write(cif_file, atoms, format="cif")
+        write(cif_file, structure.to_ase(), format="cif")
         return
 
-    from pymatgen.io.ase import AseAtomsAdaptor
     from pymatgen.io.cif import CifWriter
 
-    pmg = AseAtomsAdaptor().get_structure(atoms)
-    # Collapse duplicated periodic images from boundary-completion (returns a new
-    # Structure in current pymatgen; mutated in place in older ones).
-    merged = pmg.merge_sites(tol=0.01, mode="delete")
-    if merged is not None:
-        pmg = merged
+    pmg = _to_pymatgen(structure)
     try:
         CifWriter(pmg, symprec=0.01 if symmetry else None).write_file(cif_file)
     except Exception:  # noqa: BLE001 - symmetry undeterminable: write an unreduced P1 CIF
@@ -234,10 +244,48 @@ def output_properties(path: str) -> dict:
     return props
 
 
+# ── shared by the savers ──────────────────────────────────────────────────
+def _has_lattice(structure: Structure) -> bool:
+    """Whether ``structure`` should be written as a periodic cell at all.
+
+    A structure with no periodic direction — or with a degenerate (all-zero)
+    cell — is a molecule: there is no lattice for pymatgen to build on.
+    """
+    return bool(structure.is_periodic) and not np.allclose(structure.cell, 0.0)
+
+
+def _to_pymatgen(structure: Structure):
+    """A pymatgen ``Structure``, with boundary-completion duplicates merged out.
+
+    The structure handed to a saver is the *displayed* cell, which may be
+    "packed" (boundary atoms duplicated as periodic images). pymatgen's symmetry
+    finder raises on those coincident sites, so they are collapsed first
+    (``merge_sites`` returns a new Structure in current pymatgen; older versions
+    mutate in place and return ``None``).
+    """
+    from pymatgen.io.ase import AseAtomsAdaptor
+
+    pmg = AseAtomsAdaptor().get_structure(structure.to_ase())
+    merged = pmg.merge_sites(tol=0.01, mode="delete")
+    return pmg if merged is None else merged
+
+
+def _to_pymatgen_molecule(structure: Structure):
+    """A pymatgen ``Molecule`` — for systems with no lattice to speak of."""
+    from pymatgen.core.structure import Molecule
+
+    atoms = structure.to_ase()
+    return Molecule(atoms.get_chemical_symbols(), atoms.get_positions())
+
+
 # ── internal conversions (avoid CRYSTALClear.convert's broken wrappers) ────
 def _is_gui(path: str) -> bool:
     ext = os.path.splitext(path)[1].lower()
     return ext == ".gui" or os.path.basename(path).startswith("fort.34")
+
+
+def _is_cif(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() == ".cif"
 
 
 def _out_to_ase(path: str, initial: bool) -> Atoms:
@@ -245,6 +293,21 @@ def _out_to_ase(path: str, initial: bool) -> Atoms:
 
     geom = Crystal_output(path).get_geometry(initial=initial)
     return _pmg_to_ase(geom)
+
+
+def _cif_to_ase(path: str) -> Atoms:
+    """Read a CIF into ase.Atoms via pymatgen (applies the file's symmetry).
+
+    pymatgen's ``CifParser`` expands the asymmetric unit by the CIF's symmetry
+    operations, so the full conventional cell is returned — matching what a
+    crystallographer expects, and what the CRYSTAL readers already produce.
+    """
+    from pymatgen.io.cif import CifParser
+
+    structures = CifParser(path).parse_structures(primitive=False)
+    if not structures:
+        raise ValueError("no structure found in the CIF file")
+    return _pmg_to_ase(structures[0])
 
 
 def _pmg_to_ase(pmg_obj) -> Atoms:

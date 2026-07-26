@@ -39,6 +39,25 @@ def test_output_plots_read_the_out_file_and_data_plots_need_a_file():
     assert by_key["ir"].group is None
 
 
+def test_2d_elastic_entries_appear_only_when_crystalclear_can_draw_them(monkeypatch):
+    """``plot_cry_ela_2D`` is newer than some CRYSTALClear builds, so the 2D
+    sections are registered on capability, not unconditionally."""
+    monkeypatch.setattr(plotting, "_has_plot_function", lambda name: False)
+    assert not [k for k in plotting.available_plots() if k.key.startswith("ela2d")]
+
+    monkeypatch.setattr(plotting, "_has_plot_function", lambda name: True)
+    kinds = {k.key: k for k in plotting.available_plots()}
+    keys = ["ela2d_young", "ela2d_comp", "ela2d_shear", "ela2d_poisson"]
+    assert set(keys) <= set(kinds)
+    for key in keys:
+        kind = kinds[key]
+        assert kind.source == "output"  # read straight from the loaded .out
+        assert kind.group == "Elastic properties (2D)"  # own submenu, beside the 3D one
+        assert kind.probe == ("get_elatensor", "elatensor")
+    # the 3D surfaces keep their own submenu
+    assert kinds["ela_young"].group == "Elastic properties"
+
+
 def test_to_figure_normalises_return_shapes():
     from matplotlib.figure import Figure
 
@@ -97,6 +116,21 @@ def test_phonon_band_end_to_end():
     fig = kind.build(_F25[0])
     assert isinstance(fig, Figure)
     assert fig.axes  # something was drawn
+
+
+@pytest.mark.skipif(not _ELA, reason="no sample elastic .out available")
+def test_2d_elastic_sections_end_to_end():
+    pytest.importorskip("CRYSTALClear")
+    if not plotting._has_plot_function("plot_cry_ela_2D"):
+        pytest.skip("installed CRYSTALClear has no plot_cry_ela_2D")
+    from matplotlib.figure import Figure
+
+    by_key = {k.key: k for k in plotting.available_plots()}
+    for key in ("ela2d_young", "ela2d_comp", "ela2d_shear", "ela2d_poisson"):
+        fig = by_key[key].build(_ELA[0])
+        assert isinstance(fig, Figure)
+        assert fig.axes and fig.axes[0].name == "polar"  # polar sections
+        assert fig.axes[0].get_lines()  # a curve per plane
 
 
 @pytest.mark.skipif(not _ELA, reason="no sample elastic .out available")

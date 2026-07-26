@@ -14,7 +14,22 @@ from crystalline.core.cells import (  # noqa: E402
     tile_supercell,
 )
 from crystalline.core.structure import Structure  # noqa: E402
-from crystalline.crystalio.loader import save_structure_cif  # noqa: E402
+from crystalline.crystalio.loader import load, load_structure, save_structure_cif  # noqa: E402
+
+
+def test_cif_round_trips_through_load(tmp_path):
+    """A .cif can be opened as a full structure (not just imported as atoms)."""
+    nacl = Structure.from_ase(bulk("NaCl", "rocksalt", a=5.64, cubic=True))
+    cif = tmp_path / "nacl.cif"
+    save_structure_cif(nacl, str(cif))
+
+    loaded = load_structure(str(cif))
+    assert len(loaded) == 8 and loaded.is_periodic
+    assert loaded.to_ase().get_chemical_formula() == "Cl4Na4"
+
+    result = load(str(cif))  # the GUI entry point: geometry only, never phonons
+    assert result.modes is None and not result.has_phonons
+    assert len(result.structure) == 8
 
 
 def test_periodic_cif_has_cell_and_symmetry(tmp_path):
