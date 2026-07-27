@@ -4,7 +4,7 @@
 
 <p align="center">
   A desktop app for building, editing and visualising <b>CRYSTAL</b> structures
-  and their <b>vibrational (phonon) modes</b> — built on
+  and their <b>phonon modes</b> — built on
   <a href="https://github.com/crystaldevs/CRYSTALClear">CRYSTALClear</a>.
 </p>
 
@@ -16,17 +16,24 @@
   <img src="https://img.shields.io/badge/license-GPLv3-green" alt="GPLv3 license">
 </p>
 
----
+## Table of Contents 📑
 
-## Features
+- [Features](#features)
+- [Installation](#installation)
+- [Screenshots](#screenshots)
+- [License](#license)
+- [Acknowledgements](#acknowledgements)
+- [Contact](#contact)
+
+## Features 
 
 **Structure viewer**
 - Interactive 3D view (PyVista/VTK): ball-and-stick atoms, bonds, hydrogen
-  bonds (dashed D–H···A contacts), coordination polyhedra (VESTA-style, shown
+  bonds (dashed D–H···A interactions), coordination polyhedra (VESTA-style, shown
   by default), the unit-cell wireframe and an a/b/c gizmo.
 - One-click view alignment down the **a**, **b** or **c** axis.
 - A rich, dockable **Display** panel: atom size/opacity, per-element colours,
-  bond radius/tolerance, hydrogen bonds, cell & axes, polyhedra, measurement
+  bond radius/tolerance, hydrogen bonds, cell, axes, polyhedra, measurement
   colours, background colour, projection, an orientation marker and element labels.
 - Crystallographic **Info** panel, dimensionality-aware: space group(3D) or
   layer group(2D slabs), point group, lattice parameters, cell volume/area,
@@ -53,7 +60,7 @@
   lattice parameters.
 
 **Import / export**
-- Open CRYSTAL `.out` / `.gui` / `.f34` files and `.cif`** structures.
+- Open CRYSTAL `.out` / `.gui` / `.f34` files and `.cif` structures.
 - Import atoms from `.xyz` / `.pdb` / `.cif` into the current structure.
 - Save the structure as `.gui` or `.cif` (symmetry-reduced).
 - Export the 3D view as an image (PNG/JPEG/TIFF/SVG/PDF/EPS) with resolution and
@@ -71,9 +78,60 @@
   coupling.
 
 **Property plots** (via CRYSTALClear, shown in a dockable tabbed panel)
-- IR & Raman spectra, elastic surfaces (Young's modulus, linear compressibility,
-  shear, Poisson), equation of state.
-- Electronic & phonon band structures and densities of states, simulated XRD.
+- IR and Raman spectra, elastic properties (Young's modulus, linear compressibility,
+  shear modulus, Poisson ratio), equation of state.
+- Electronic and phonon band structures and densities of states, simulated XRD.
+
+## Installation
+
+Public releases of the code are distributed through Pypi.
+
+### Requirements
+
+The following will be installed if not already present:
+
+- PySide6 < 6.10 >=6.5
+- pyvista >= 0.43
+- pyvistaqt >= 0.11
+- numpy >= 1.23
+- ase >= 3.23
+- pymatgen >= 2023.11.10
+- CRYSTALClear >= 0.2
+
+### Steps
+
+1. Create a conda environment (suggested)
+   ```sh
+   conda create --name crystal
+   ```
+2. Activate the environment (suggested)
+   ```sh
+   conda activate crystal
+   ```
+3. Install
+   ```sh
+   pip install CRYSTALLine
+   ```
+
+## Usage
+
+```sh
+crystalline
+```
+
+Use **File → Open** to load a CRYSTAL `.out`/`.gui`/`.34` file or a `.cif`. If a
+CRYSTAL output contains a vibrational calculation, the phonon modes are loaded
+too — pick one in the **Phonons** panel and press **Play**. Otherwise the
+geometry is shown on its own. Tweak the look from the **Display** panel, measure
+geometry from the **Geometry** panel, and build property plots from the **Plot**
+menu.
+
+Enable **Edit → Editing mode** (`Ctrl+E`) to edit atoms: click to select, drag or
+**arrow-key** the selection to move it, `Del` to delete, and pick elements from
+the visual periodic table.
+
+CRYSTALLine runs on **Linux, macOS and Windows** — anywhere PySide6 and a working
+OpenGL/VTK stack are available.
 
 ## Screenshots
 
@@ -113,37 +171,6 @@ Only `ui/` (and the viewport that embeds the VTK interactor) imports Qt. Adding 
 new property (a new plot, panel, …) is a matter of dropping a widget into
 `ui/panels/` and wiring its signals in `MainWindow`.
 
-## Usage
-
-```sh
-python -m crystalline
-# or, after install, just:
-crystalline
-```
-
-Use **File → Open** to load a CRYSTAL `.out`/`.gui`/`.34` file or a `.cif`. If a
-CRYSTAL output contains a vibrational calculation, the phonon modes are loaded
-too — pick one in the **Phonons** panel and press **Play**. Otherwise the
-geometry is shown on its own. Tweak the look from the **Display** panel, measure
-geometry from the **Geometry** panel, and build property plots from the **Plot**
-menu.
-
-Enable **Edit → Editing mode** (`Ctrl+E`) to edit atoms: click to select, drag or
-**arrow-key** the selection to move it, `Del` to delete, and pick elements from
-the visual periodic table.
-
-CRYSTALLine runs on **Linux, macOS and Windows** — anywhere PySide6 and a working
-OpenGL/VTK stack are available.
-
-## Testing
-
-```sh
-pytest
-```
-
-The suite runs headless and exercises the Qt-free core, the renderer (via an
-off-screen PyVista plotter), the plotting adapter and the file I/O.
-
 ## License
 
 [GNU General Public License v3.0 or later](LICENSE).
@@ -157,3 +184,9 @@ chemistry code.
 This software was developed with the assistance of
 [Claude](https://www.anthropic.com/claude) (Anthropic), using
 [Claude Code](https://www.claude.com/product/claude-code).
+
+## Contact
+
+- Website: https://www.crystal.unito.it
+- Email: crystalunito@gmail.com
+- Instagram: [@crystaldevs](https://www.instagram.com/crystaldevs/)
