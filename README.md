@@ -148,11 +148,11 @@ forced `QT_QPA_PLATFORM=wayland` yourself, startup fails with
 QT_QPA_PLATFORM=xcb crystalline
 ```
 
-On Ubuntu 24.04 the `xcb` plugin also needs a system library that isn't pulled
+On Ubuntu 24.04 the `xcb` plugin also needs system libraries that aren't pulled
 in by pip:
 
 ```sh
-sudo apt install libxcb-cursor0
+sudo apt install libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 libxkbcommon-x11-0
 ```
 
 ## Screenshots
