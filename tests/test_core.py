@@ -145,6 +145,59 @@ def test_displaced_positions_at_key_phases():
     assert np.allclose(peak, eq + 0.5 * evec)
 
 
+def test_amplitude_is_the_peak_atomic_displacement_whatever_the_cell_size():
+    """Eigenvectors come back normalised over all 3N components, so the motion
+    of any one atom faded as 1/sqrt(N) and the default amplitude that suited a
+    molecule was invisible for a large cell. Amplitude now means the peak
+    displacement of the most-displaced atom, in Angstrom."""
+    for natom in (2, 50, 500):
+        eq = np.zeros((natom, 3))
+        evec = np.zeros((natom, 3))
+        evec[:, 0] = 1.0
+        evec /= np.linalg.norm(evec)  # as CRYSTALClear normalises it
+
+        peak = displaced_positions(eq, PhononMode(100.0, evec), amplitude=0.4, phase=np.pi / 2)
+        assert np.isclose(np.max(np.linalg.norm(peak - eq, axis=1)), 0.4)
+
+
+def test_amplitude_keeps_the_relative_motion_within_a_mode():
+    # One atom moving twice as far as another must still do so after scaling.
+    eq = np.zeros((3, 3))
+    evec = np.array([[2.0, 0, 0], [1.0, 0, 0], [0.0, 0, 0]])
+    peak = displaced_positions(eq, PhononMode(100.0, evec), amplitude=0.5, phase=np.pi / 2)
+    assert np.allclose(peak[:, 0], [0.5, 0.25, 0.0])
+
+
+def test_a_null_eigenvector_does_not_move_or_blow_up():
+    eq = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    mode = PhononMode(frequency=0.0, eigenvector=np.zeros((2, 3)))
+    assert np.allclose(displaced_positions(eq, mode, amplitude=1.0, phase=np.pi / 2), eq)
+
+
+def test_activity_labels_ride_along_with_the_mode():
+    mode = PhononMode(
+        frequency=1050.0,
+        eigenvector=np.eye(3)[:2],
+        ir_active=True,
+        raman_active=False,
+        ir_intensity=12.5,
+    )
+    assert mode.has_activity
+
+    # Remapping onto a supercell keeps frequency and labels, swaps the vectors.
+    tiled = mode.with_eigenvector(np.zeros((4, 3)))
+    assert tiled.n_atoms == 4
+    assert tiled.frequency == 1050.0
+    assert tiled.ir_active is True and tiled.raman_active is False
+    assert tiled.ir_intensity == 12.5
+
+    # An output without the analysis leaves the labels unknown, not False.
+    plain = PhononMode(frequency=1050.0, eigenvector=np.eye(3)[:2])
+    assert plain.ir_active is None and not plain.has_activity
+    assert not PhononModes([plain]).has_activity
+    assert PhononModes([plain, mode]).has_activity
+
+
 def test_phonon_modes_collection():
     modes = PhononModes(
         [PhononMode(10.0, np.zeros((2, 3))), PhononMode(-5.0, np.zeros((2, 3)))]

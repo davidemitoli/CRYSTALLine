@@ -20,7 +20,7 @@ import numpy as np
 import pyvista as pv
 
 from crystalline.core.phonons import PhononMode
-from crystalline.viz.phonon_animator import PhononAnimator
+from crystalline.viz.phonon_animator import DEFAULT_AMPLITUDE, PhononAnimator
 from crystalline.viz.renderer import StructureRenderer
 from crystalline.viz.render_settings import RenderSettings
 
@@ -67,7 +67,7 @@ def render_animation_frames(
     mode: PhononMode,
     settings: Optional[RenderSettings] = None,
     *,
-    amplitude: float = 0.5,
+    amplitude: float = DEFAULT_AMPLITUDE,
     n_frames: int = DEFAULT_FRAMES,
     reference_cell=None,
     bond_structure=None,

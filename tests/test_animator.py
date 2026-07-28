@@ -81,7 +81,7 @@ def test_bonds_survive_a_large_amplitude_animation():
     eigenvector = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [-0.25, 0.97, 0.0]])
     animator = PhononAnimator(renderer)
     animator.set_mode(structure.positions, PhononMode(frequency=3600.0, eigenvector=eigenvector))
-    animator.amplitude = 1.5  # far beyond the 0.5 default
+    animator.amplitude = 1.5  # far beyond the default
 
     for phase in PhononAnimator.phase_sequence(24):
         animator.set_frame(float(phase))

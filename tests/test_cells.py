@@ -163,6 +163,30 @@ def test_supercell_tiles_atoms_and_replicates_modes():
         assert np.allclose(disp, expected)
 
 
+def test_supercell_keeps_the_ir_raman_labels():
+    """Tiling only re-indexes the eigenvector; the selection rules the panel
+    filters on must survive, or a supercell view loses the IR/Raman filter."""
+    nacl = Structure.from_ase(bulk("NaCl", "rocksalt", a=5.64))
+    modes = PhononModes(
+        [
+            PhononMode(
+                frequency=100.0,
+                eigenvector=np.array([[1, 0, 0], [-1, 0, 0]], float),
+                ir_active=True,
+                raman_active=False,
+                ir_intensity=42.0,
+            )
+        ]
+    )
+
+    _sup, sup_modes = tile_supercell(nacl, (2, 2, 2), modes)
+
+    assert sup_modes[0].ir_active is True
+    assert sup_modes[0].raman_active is False
+    assert sup_modes[0].ir_intensity == 42.0
+    assert sup_modes.has_activity
+
+
 def test_boundary_completion_adds_partial_molecules():
     # Dry ice: 4 whole CO2 in the cell -> completing the boundary adds the
     # corner/edge/face molecules that partially belong, all kept whole.

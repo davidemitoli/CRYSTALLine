@@ -14,6 +14,7 @@ import ast
 import inspect
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 pytest.importorskip("PySide6")
@@ -137,29 +138,58 @@ def test_rotate_buttons_sit_beside_the_axis_buttons(qapp):
     window = _StubWindow()
     menus.build_menus(window)
 
-    assert len(window._rotate_buttons) == 4  # left / right / up / down
-    assert [b.text() for b in window._rotate_buttons] == ["◀", "▶", "▲", "▼"]
+    # left / right / up / down + the two in-screen-plane (roll) buttons
+    assert len(window._rotate_buttons) == 6
+    assert [b.text() for b in window._rotate_buttons] == ["◀", "▶", "▲", "▼", "↺", "↻"]
     assert all(b.autoRepeat() for b in window._rotate_buttons)  # hold to keep turning
 
     # they orbit the view, and unlike a/b/c alignment they need no cell
     turned = []
-    window.rotate_view = lambda az=0.0, el=0.0: turned.append((az, el))
+    window.rotate_view = lambda az=0.0, el=0.0, roll=0.0: turned.append((az, el, roll))
     for button in window._rotate_buttons:
         button.click()
-    assert turned == [(-15.0, 0.0), (15.0, 0.0), (0.0, 15.0), (0.0, -15.0)]
+    assert turned == [
+        (-15.0, 0.0, 0.0),
+        (15.0, 0.0, 0.0),
+        (0.0, 15.0, 0.0),
+        (0.0, -15.0, 0.0),
+        (0.0, 0.0, -15.0),  # anticlockwise in the screen plane
+        (0.0, 0.0, 15.0),  # clockwise
+    ]
 
 
 def test_viewport_provides_the_rotation_the_toolbar_calls():
-    """The buttons call viewport.rotate_view(azimuth, elevation) — it must exist
-    with that shape (the Viewport itself can't be built headless)."""
+    """The buttons call viewport.rotate_view(azimuth, elevation, roll) — it must
+    exist with that shape (the Viewport itself can't be built headless)."""
     import inspect
 
     from crystalline.ui.viewport import Viewport
 
     assert callable(Viewport.rotate_view)
     parameters = inspect.signature(Viewport.rotate_view).parameters
-    assert list(parameters) == ["self", "azimuth", "elevation"]
-    assert parameters["azimuth"].default == 0.0 and parameters["elevation"].default == 0.0
+    assert list(parameters) == ["self", "azimuth", "elevation", "roll"]
+    assert all(parameters[name].default == 0.0 for name in ("azimuth", "elevation", "roll"))
+
+
+def test_roll_sign_makes_the_structure_turn_the_way_the_button_says():
+    """``rotate_view(roll=+x)`` must turn the structure *clockwise* on screen.
+
+    vtkCamera.Roll turns the view-up vector, so the scene goes the opposite way
+    — hence the negation in Viewport.rotate_view. Pin the convention here: a
+    sign flip is silent otherwise.
+    """
+    vtk = pytest.importorskip("vtk")
+
+    camera = vtk.vtkCamera()
+    camera.SetPosition(0, 0, 10)
+    camera.SetFocalPoint(0, 0, 0)
+    camera.SetViewUp(0, 1, 0)
+
+    camera.Roll(-90)  # what rotate_view(roll=+90) does under the hood
+
+    # Screen-up now points along world -x, so a feature that was at the top of
+    # the screen (world +y) has moved to the right: a clockwise turn.
+    assert np.allclose(camera.GetViewUp(), [-1, 0, 0], atol=1e-9)
 
 
 def test_viewport_eventfilter_routes_the_delete_key(qapp):

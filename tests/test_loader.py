@@ -53,3 +53,17 @@ def test_load_of_a_cif_carries_no_phonon_modes(tmp_path):
     assert result.structure.is_periodic
     assert result.modes is None  # a CIF is geometry only — never scanned as a CRYSTAL out
     assert not result.has_phonons
+
+
+def test_per_mode_normalises_crystalclear_activity_arrays():
+    """CRYSTALClear leaves IR/Raman/intens empty when the output has no
+    selection-rule analysis; the modes must then read "unknown" rather than
+    "inactive", which would let the panel's filter hide every mode."""
+    from crystalline.crystalio.loader import _per_mode
+
+    assert _per_mode([True, False, True], 3) == [True, False, True]
+    assert _per_mode([], 3) == [None, None, None]  # no analysis in the output
+    assert _per_mode(None, 2) == [None, None]
+    assert _per_mode([True, False], 3) == [None, None, None]  # misaligned -> unlabelled
+    assert _per_mode([1.5, 0.0], 2, cast=float) == [1.5, 0.0]
+    assert _per_mode([np.nan, 2.0], 2, cast=float) == [None, 2.0]  # NaN'd imaginary mode

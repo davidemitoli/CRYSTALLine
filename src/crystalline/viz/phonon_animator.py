@@ -12,6 +12,11 @@ import numpy as np
 from crystalline.core.phonons import PhononMode, displaced_positions
 from crystalline.viz.renderer import StructureRenderer
 
+# Default peak displacement in Angstrom. Chosen to match the motion the old
+# cell-normalised amplitude gave for a small molecule — the case that looked
+# right — now that the scale no longer shrinks with the number of atoms.
+DEFAULT_AMPLITUDE = 0.3
+
 
 class PhononAnimator:
     """Drive a :class:`StructureRenderer` to show a vibrating mode."""
@@ -20,7 +25,10 @@ class PhononAnimator:
         self.renderer = renderer
         self._equilibrium: np.ndarray | None = None
         self._mode: PhononMode | None = None
-        self.amplitude: float = 0.5
+        # Peak displacement (Angstrom) of the most-displaced atom — see
+        # core.phonons.displaced_positions. Being per-atom rather than per-cell,
+        # this one default reads well for a molecule and for a large cell alike.
+        self.amplitude: float = DEFAULT_AMPLITUDE
 
     def set_mode(self, equilibrium: np.ndarray, mode: PhononMode) -> None:
         """Select the mode to animate around a fixed equilibrium geometry.
@@ -62,4 +70,4 @@ class PhononAnimator:
         return np.linspace(0.0, 2.0 * np.pi, n_frames, endpoint=False)
 
 
-__all__ = ["PhononAnimator"]
+__all__ = ["DEFAULT_AMPLITUDE", "PhononAnimator"]
