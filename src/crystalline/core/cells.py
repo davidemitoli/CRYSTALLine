@@ -37,7 +37,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from crystalline.core.phonons import PhononMode, PhononModes
+from crystalline.core.phonons import PhononModes
 from crystalline.core.structure import Structure
 
 # ase array key used to carry each atom's source index through the supercell
@@ -212,7 +212,7 @@ def expand_modes_to_conventional(
     """
     atoms, mapping = _conventional_expansion(structure, symprec)
     expanded = PhononModes(
-        [PhononMode(frequency=m.frequency, eigenvector=m.eigenvector[mapping]) for m in modes]
+        [m.with_eigenvector(m.eigenvector[mapping]) for m in modes]
     )
     return Structure.from_ase(_wrap_molecules(atoms)), expanded
 
@@ -260,7 +260,7 @@ def tile_supercell(
     tiled_modes = modes
     if modes is not None and mapping is not None:
         tiled_modes = PhononModes(
-            [PhononMode(frequency=m.frequency, eigenvector=m.eigenvector[mapping]) for m in modes]
+            [m.with_eigenvector(m.eigenvector[mapping]) for m in modes]
         )
     elif modes is not None:
         # Couldn't recover the mapping: drop the modes rather than hand back
@@ -387,7 +387,7 @@ def complete_boundary(
     new_modes = modes
     if modes is not None:
         new_modes = PhononModes(
-            [PhononMode(frequency=m.frequency, eigenvector=m.eigenvector[mapping]) for m in modes]
+            [m.with_eigenvector(m.eigenvector[mapping]) for m in modes]
         )
     return Structure.from_ase(atoms), new_modes
 

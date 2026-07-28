@@ -132,15 +132,47 @@ def load_phonons(
     freqs = np.atleast_2d(np.asarray(out.frequency))[qpoint]
     eigvecs = np.asarray(out.eigenvector)[qpoint]
 
+    # IR/Raman selection rules are only printed for the Gamma point.
+    nmode = len(freqs)
+    if qpoint == 0:
+        ir = _per_mode(getattr(out, "IR", None), nmode)
+        raman = _per_mode(getattr(out, "Raman", None), nmode)
+        intens = _per_mode(getattr(out, "intens", None), nmode, cast=float)
+    else:
+        ir = raman = intens = [None] * nmode
+
     modes = [
         PhononMode(
             frequency=float(np.real(freqs[i])) * THZ_TO_CM,
             eigenvector=np.real(eigvecs[i]).reshape(natom, 3),
+            ir_active=ir[i],
+            raman_active=raman[i],
+            ir_intensity=intens[i],
         )
-        for i in range(len(freqs))
+        for i in range(nmode)
     ]
 
     return structure, PhononModes(modes)
+
+
+def _per_mode(values, nmode: int, cast=bool) -> list:
+    """Normalise a CRYSTALClear per-mode array to a length-``nmode`` list.
+
+    ``out.IR`` / ``out.Raman`` / ``out.intens`` are empty when the output has no
+    IR/Raman analysis (dispersion runs, or FREQCALC without intensities), and
+    the modes then simply carry ``None`` rather than a wrong ``False``. A
+    length mismatch is treated the same way — better unlabelled than misaligned.
+    """
+    if values is None:
+        return [None] * nmode
+    arr = np.asarray(values).ravel()
+    if arr.size != nmode:
+        return [None] * nmode
+    out = []
+    for v in arr:
+        value = cast(v)
+        out.append(None if isinstance(value, float) and not np.isfinite(value) else value)
+    return out
 
 
 def save_structure_gui(structure: Structure, gui_file: str, symmetry: bool = True) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from typing import Optional
 
@@ -18,9 +19,10 @@ def run(structure: Optional[Structure] = None) -> int:
     from crystalline.resources import logo_path
     from crystalline.ui.main_window import MainWindow
 
-    # Must run *before* QApplication is created: Qt reads the macOS bundle name
-    # once, at construction, to title the application menu.
+    # Both must run *before* QApplication is created: Qt reads the macOS bundle
+    # name once, at construction, and the platform plugin is chosen there too.
     _name_macos_app(_APP_NAME)
+    _prefer_x11_on_wayland()
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(_APP_NAME)
@@ -30,6 +32,34 @@ def run(structure: Optional[Structure] = None) -> int:
     window = MainWindow(structure)
     window.show()
     return app.exec()
+
+
+def _prefer_x11_on_wayland() -> bool:
+    """On a Wayland session, ask Qt for the X11 (xcb) plugin. Returns whether set.
+
+    VTK's render window is an X11 one: pyvistaqt hands it the Qt widget's
+    ``winId()`` as a string, which ``vtkXOpenGLRenderWindow::SetWindowInfo``
+    parses into an X ``Window`` id. Under a native Wayland Qt plugin that id is
+    a 64-bit surface pointer, so the parse overflows ("The result is out of
+    range, failed to get the converted tmp") and VTK then calls
+    ``XConfigureWindow`` on a bogus id — Xlib aborts the process with
+    ``BadWindow``. Running Qt on XWayland instead gives a real X window id.
+
+    Only applied when the user hasn't chosen a platform plugin themselves and
+    an X display (XWayland) is actually there to fall back to.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    if os.environ.get("QT_QPA_PLATFORM"):
+        return False  # an explicit choice is the user's to make
+    on_wayland = (
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        or bool(os.environ.get("WAYLAND_DISPLAY"))
+    )
+    if not on_wayland or not os.environ.get("DISPLAY"):
+        return False
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
+    return True
 
 
 def _name_macos_app(name: str) -> None:

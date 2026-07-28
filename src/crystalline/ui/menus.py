@@ -292,11 +292,15 @@ def _build_toolbars(window) -> None:
     rotate_caption = QLabel("Rotate")
     rotate_caption.setContentsMargins(2, 0, 6, 0)
     view_toolbar.addWidget(rotate_caption)
-    for label, tooltip, azimuth, elevation in (
-        ("◀", "Rotate left", -_ROTATE_STEP_DEG, 0.0),
-        ("▶", "Rotate right", _ROTATE_STEP_DEG, 0.0),
-        ("▲", "Rotate up", 0.0, _ROTATE_STEP_DEG),
-        ("▼", "Rotate down", 0.0, -_ROTATE_STEP_DEG),
+    # The last two spin the structure in the screen plane (about the axis
+    # perpendicular to the screen) rather than orbiting the camera around it.
+    for label, tooltip, azimuth, elevation, roll in (
+        ("◀", "Rotate left", -_ROTATE_STEP_DEG, 0.0, 0.0),
+        ("▶", "Rotate right", _ROTATE_STEP_DEG, 0.0, 0.0),
+        ("▲", "Rotate up", 0.0, _ROTATE_STEP_DEG, 0.0),
+        ("▼", "Rotate down", 0.0, -_ROTATE_STEP_DEG, 0.0),
+        ("↺", "Rotate anticlockwise in the screen plane", 0.0, 0.0, -_ROTATE_STEP_DEG),
+        ("↻", "Rotate clockwise in the screen plane", 0.0, 0.0, _ROTATE_STEP_DEG),
     ):
         button = QToolButton(window)
         button.setText(label)
@@ -304,7 +308,9 @@ def _build_toolbars(window) -> None:
         button.setAutoRepeat(True)  # hold to keep turning
         button.setStyleSheet(_axis_chip_style(_ROTATE_CHIP_COLOR))
         button.clicked.connect(
-            lambda _checked=False, a=azimuth, e=elevation: window.viewport.rotate_view(a, e)
+            lambda _checked=False, a=azimuth, e=elevation, r=roll: window.viewport.rotate_view(
+                a, e, r
+            )
         )
         view_toolbar.addWidget(button)
         window._rotate_buttons.append(button)

@@ -170,14 +170,16 @@ class Viewport(QWidget):
         """Draw the Geometry panel's measurements over the structure."""
         self.renderer.set_annotations(annotations)
 
-    def rotate_view(self, azimuth: float = 0.0, elevation: float = 0.0) -> None:
+    def rotate_view(self, azimuth: float = 0.0, elevation: float = 0.0, roll: float = 0.0) -> None:
         """Orbit the camera around the structure by the given angles (degrees).
 
         ``azimuth`` turns the crystal left/right about the current up direction,
-        ``elevation`` tips it up/down. The camera keeps its distance, so this is
-        a pure rotation of the view — the counterpart of the a/b/c alignment
-        buttons for looking at the structure from an arbitrary angle. Works with
-        or without a cell.
+        ``elevation`` tips it up/down, and ``roll`` spins it in the screen plane
+        about the axis perpendicular to the screen (positive = the structure
+        turns clockwise). The camera keeps its distance, so this is a pure
+        rotation of the view — the counterpart of the a/b/c alignment buttons
+        for looking at the structure from an arbitrary angle. Works with or
+        without a cell.
         """
         if self._structure is None:
             return
@@ -188,6 +190,11 @@ class Viewport(QWidget):
             camera.Elevation(elevation)
             # Elevation alone skews (and at the poles flips) the up vector.
             camera.OrthogonalizeViewUp()
+        if roll:
+            # vtkCamera.Roll turns the *up vector* about the view direction, so
+            # the scene appears to go the other way: negate to make a positive
+            # roll read as the structure turning clockwise on screen.
+            camera.Roll(-roll)
         self._drag.reactivate()
         self.interactor.render()
 

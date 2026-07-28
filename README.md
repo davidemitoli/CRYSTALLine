@@ -47,9 +47,13 @@
 
 **Phonons**
 - Loads vibrational modes automatically when the CRYSTAL output has them.
+- Filter the mode list to the IR- and/or Raman-active modes when the output
+  reports the selection rules.
 - Animate any mode in place — bonds, polyhedra and hydrogen bonds follow the
-  motion; export the animation as GIF / MP4 / PNG frames with configurable
-  resolution, frame count and frame rate.
+  motion; the amplitude is the peak displacement of the most-displaced atom,
+  so one setting works for a molecule and for a large cell alike, and playback
+  speed is adjustable. Export the animation as GIF / MP4 / PNG frames with
+  configurable resolution, frame count and frame rate.
 
 **Editing**
 - Select atoms (click / Ctrl-click), drag them in 3D (periodic images move
@@ -132,6 +136,24 @@ the visual periodic table.
 
 CRYSTALLine runs on **Linux, macOS and Windows** — anywhere PySide6 and a working
 OpenGL/VTK stack are available.
+
+### Linux: Wayland sessions
+
+VTK draws into an X11 window, so on a Wayland session CRYSTALLine asks Qt for
+the X11 (`xcb`) plugin automatically and runs through XWayland. If you have
+forced `QT_QPA_PLATFORM=wayland` yourself, startup fails with
+`BadWindow (invalid Window parameter)` — unset it, or run:
+
+```sh
+QT_QPA_PLATFORM=xcb crystalline
+```
+
+On Ubuntu 24.04 the `xcb` plugin also needs a system library that isn't pulled
+in by pip:
+
+```sh
+sudo apt install libxcb-cursor0
+```
 
 ## Screenshots
 
