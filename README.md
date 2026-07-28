@@ -37,8 +37,11 @@
   colours, background colour, projection, an orientation marker and element labels.
 - Crystallographic **Info** panel, dimensionality-aware: space group(3D) or
   layer group(2D slabs), point group, lattice parameters, cell volume/area,
-  density and formula — recomputed live as you edit — plus CRYSTAL-computed
-  properties (total energy, band gap, Fermi energy) read from the output.
+  density and formula — recomputed live as you edit.
+- The same panel summarises the CRYSTAL run itself: code version, task,
+  Hamiltonian and exchange/correlation functional (with the exact-exchange
+  fraction and dispersion correction), k-point mesh, basis-set size, SCF
+  thresholds, and the computed total energy, band gap and Fermi energy.
 
 **Geometry & measurements**
 - Measure a selection: distance (2 atoms), angle (3), dihedral (4) or
