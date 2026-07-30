@@ -40,6 +40,21 @@ class PhononAnimator:
         self._equilibrium = np.asarray(equilibrium, dtype=float)
         self._mode = mode
         self.renderer.set_bond_reference(self._equilibrium)
+        # Show the mode as an arrow field too: the animation reads well on screen,
+        # the arrows are what survives into a still image.
+        self.renderer.set_mode_vectors(mode.eigenvector)
+
+    def clear_mode(self) -> None:
+        """Forget the selected mode and take its arrows off the view.
+
+        Deliberately does not touch atom positions: this runs when the modes
+        themselves go away (a new file, an edit that changed the atom count), by
+        which point the geometry on screen is already the new one.
+        """
+        self._mode = None
+        self._equilibrium = None
+        self.renderer.set_bond_reference(None)
+        self.renderer.set_mode_vectors(None)
 
     def set_frame(self, phase: float) -> None:
         """Render one frame at animation ``phase`` (radians)."""

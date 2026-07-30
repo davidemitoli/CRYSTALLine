@@ -109,7 +109,7 @@ The following will be installed if not already present:
 
 1. Create a conda environment (suggested)
    ```sh
-   conda create --name crystal
+   conda create --name crystal python=3.12
    ```
 2. Activate the environment (suggested)
    ```sh

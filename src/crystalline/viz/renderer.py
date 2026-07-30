@@ -24,6 +24,7 @@ from typing import Optional
 
 import numpy as np
 import pyvista as pv
+import vtk
 from ase.data import chemical_symbols, covalent_radii
 from ase.data.colors import jmol_colors
 from scipy.spatial import cKDTree
@@ -101,6 +102,69 @@ _LATTICE_LABELS = ("a", "b", "c")
 # the same size regardless of the lattice parameters (editing a/b/c must not
 # grow or shrink it). Comparable to a bond length, so it reads well beside atoms.
 _LATTICE_ARROW_LENGTH = 2.0
+# How far past the arrow tip its label sits, as a multiple of the arrow length.
+_LATTICE_LABEL_OFFSET = 1.18
+# Corner of the render window the gizmo occupies, as (xmin, ymin, xmax, ymax)
+# in normalised viewport coordinates: the lower left, a fifth of each side.
+_GIZMO_VIEWPORT = (0.0, 0.0, 0.24, 0.24)
+# Label glyph size: a caption scales its text to its own normalised box, so the
+# box drives how big the letter comes out next to the arrows.
+_LATTICE_LABEL_BOX = 0.05
+_LATTICE_LABEL_FONT_SIZE = 20
+# The widget frames the marker's 3D bounds, and a 2D caption contributes none —
+# so a label anchored at an arrow tip lands on the very edge of the viewport and
+# gets clipped. An invisible sphere this many arrow-lengths across pads the
+# bounds so the letters have room.
+_GIZMO_BOUNDS_PADDING = 1.3
+
+# An atom whose displacement is below this fraction of the mode's largest gets
+# no arrow. Arrows are drawn at a uniform length, so without this cut-off an
+# atom that barely moves would be flagged as strongly as one that carries the
+# mode — and in a big cell most atoms barely move in any given mode.
+_MIN_ARROW_FRACTION = 0.05
+
+# An ADP ellipsoid whose longest semi-axis is below this (Angstrom) is too
+# small to read on screen; that atom keeps its ordinary sphere instead of
+# turning into an invisible speck.
+_MIN_ELLIPSOID_RADIUS = 0.01
+
+
+# Settings that change only how the *existing* actors are drawn — nothing about
+# the geometry, the connectivity or which atoms get which mesh depends on them.
+# A change confined to these is pushed onto the actors in place instead of
+# rebuilding the scene, which matters because the Display dock streams settings
+# continuously while a slider is dragged: an opacity drag would otherwise pay a
+# full teardown-and-redraw per tick.
+#
+# Anything not listed here (sizes, radii, tolerances, colours that live in a
+# mesh's scalar array, every ``show_*`` toggle, the ADP probability and
+# temperature) does change geometry, and still rebuilds.
+_APPEARANCE_ONLY_SETTINGS = frozenset({
+    "atom_opacity",
+    "adp_opacity",
+    "polyhedra_opacity",
+    "mode_arrow_color",
+    "background_color",
+    "parallel_projection",
+    "show_orientation_axes",
+})
+
+
+def _appearance_only_change(previous: RenderSettings, current: RenderSettings) -> bool:
+    """Whether ``current`` differs from ``previous`` *only* in drawn appearance.
+
+    False when nothing changed at all, so a caller that re-pushes identical
+    settings to force a redraw — staging ADP tensors with ``redraw=False`` and
+    then applying the settings that name them, say — still gets one.
+    """
+    from dataclasses import fields
+
+    changed = {
+        f.name
+        for f in fields(RenderSettings)
+        if getattr(previous, f.name) != getattr(current, f.name)
+    }
+    return bool(changed) and changed <= _APPEARANCE_ONLY_SETTINGS
 
 
 def _sphere_resolution(n_atoms: int) -> int:
@@ -124,6 +188,8 @@ class StructureRenderer:
         # Single glyphed actor for every atom (see module docstring). The live
         # positions/numbers/radii back both re-glyphing and pick→index mapping.
         self._atom_actor = None
+        self._atom_mesh_obj = None    # kept so a live update can move its points
+        self._atom_follow = None      # (atom index, offset) per sphere vertex
         self._positions: np.ndarray = np.empty((0, 3), dtype=float)
         self._numbers: np.ndarray = np.empty(0, dtype=int)
         self._radii: np.ndarray = np.empty(0, dtype=float)
@@ -140,6 +206,17 @@ class StructureRenderer:
         self._polyhedra_follow = None         # (atom index, offset) per hull vertex
         self._polyhedra_edge_follow = None
         self._label_actor = None
+        self._arrow_actor = None
+        # (N, 3) eigenvector of the selected phonon mode, drawn as per-atom arrows.
+        self._mode_vectors: Optional[np.ndarray] = None
+        self._adp_actor = None
+        self._adp_mesh_obj = None     # kept so animation can move its points
+        self._adp_follow = None       # (atom index, offset) per ellipsoid vertex
+        # (N, 3, 3) cartesian ADP tensors in Angstrom^2, drawn as ellipsoids.
+        self._adp_tensors: Optional[np.ndarray] = None
+        # Which atoms those tensors are drawn on, cached across live position
+        # updates — see :meth:`_ellipsoid_atoms`.
+        self._ellipsoid_mask: Optional[np.ndarray] = None
         self._annotations: list = []          # measurements drawn over the structure
         self._annotation_actors: list = []
         self._bond_structure: Optional[Structure] = None  # clean cell for coordination
@@ -160,6 +237,9 @@ class StructureRenderer:
         # If set, the cell wireframe outlines this cell (the original unit cell)
         # instead of the structure's own cell — used when a supercell is shown.
         self._reference_cell: Optional[np.ndarray] = None
+        # Screen-space a/b/c gizmo. Outlives plotter.clear(), unlike an actor,
+        # so it is created once and its marker swapped on each rebuild.
+        self._orientation_widget = None
 
     # ── public API ──────────────────────────────────────────────────────
     @property
@@ -167,9 +247,41 @@ class StructureRenderer:
         return self._settings
 
     def set_settings(self, settings: RenderSettings) -> None:
-        """Apply new appearance settings and redraw."""
+        """Apply new appearance settings, redrawing only as much as they need.
+
+        A change confined to :data:`_APPEARANCE_ONLY_SETTINGS` is pushed straight
+        onto the actors; anything else rebuilds the scene. The Display dock emits
+        on every slider tick, so making the cheap changes cheap is what keeps
+        dragging an opacity slider from freezing the view on a large cell.
+        """
+        previous = self._settings
         self._settings = settings
+        if _appearance_only_change(previous, settings):
+            self._apply_appearance()
+            self.plotter.render()
+            return
         self._rebuild()
+
+    def _apply_appearance(self) -> None:
+        """Push the appearance-only settings onto the live actors.
+
+        An unparsable colour raises, exactly as it does when ``add_mesh`` is
+        handed one during a rebuild — ``pv.Color`` is the same parser, so there is
+        no failure here that rebuilding would recover from.
+        """
+        settings = self._settings
+        self._apply_scene_settings()  # background, projection, orientation marker
+        for actor, opacity in (
+            (self._atom_actor, settings.atom_opacity),
+            (self._adp_actor, settings.adp_opacity),
+            (self._polyhedra_actor, settings.polyhedra_opacity),
+        ):
+            if actor is not None:
+                actor.GetProperty().SetOpacity(opacity)
+        if self._arrow_actor is not None:
+            self._arrow_actor.GetProperty().SetColor(
+                *pv.Color(settings.mode_arrow_color).float_rgb
+            )
 
     def set_bond_reference(self, positions: Optional[np.ndarray]) -> None:
         """Fix the bond network to the geometry at ``positions`` (``None`` clears).
@@ -183,6 +295,22 @@ class StructureRenderer:
         self._bond_reference = None if positions is None else np.asarray(positions, dtype=float)
         self._frozen_bond_pairs = None
         self._frozen_hbond_pairs = None
+
+    def set_mode_vectors(self, vectors: Optional[np.ndarray]) -> None:
+        """Draw ``vectors`` as a per-atom arrow field (``None`` clears them).
+
+        Used for the selected phonon mode's eigenvector: an animation shows the
+        motion but can't be put in a figure, and a still frame of a vibrating
+        structure looks like a distorted one. Arrows say which atoms move, how
+        far, and in which direction, all at once.
+
+        A vector set that doesn't match the atom count is simply not drawn — the
+        displayed structure can be swapped (supercell, cell view, an edit) while
+        a mode is still selected.
+        """
+        self._mode_vectors = None if vectors is None else np.asarray(vectors, dtype=float)
+        self._redraw_mode_arrows()
+        self.plotter.render()
 
     def set_reference_cell(self, cell: Optional[np.ndarray]) -> None:
         """Choose which cell the wireframe outlines (``None`` = the structure's own).
@@ -220,15 +348,11 @@ class StructureRenderer:
             raise ValueError("position count changed; call refresh() instead")
         self._positions = np.asarray(positions, dtype=float)
         self._reglyph_atoms()
-        if len(self._positions) <= _LIVE_BOND_MAX_ATOMS:
-            self._update_bonds(self._positions)
-            # The hydrogen-bond scan is the expensive one; a frozen topology makes
-            # it a gather, so only the unfrozen path needs the tighter limit.
-            if self._frozen_hbond_pairs is not None or self._bond_reference is not None:
-                self._update_hydrogen_bonds()
-            elif len(self._positions) <= _LIVE_HBOND_MAX_ATOMS:
-                self._update_hydrogen_bonds()
+        self._update_live_bonds()
         self._update_polyhedra(self._positions)
+        self._update_adp_ellipsoids(self._positions)
+        if self._mode_vectors is not None:
+            self._redraw_mode_arrows()  # arrows ride along with the atoms
         self.plotter.render()
 
     @property
@@ -243,7 +367,9 @@ class StructureRenderer:
         atom; the picked surface point is resolved to the nearest atom centre.
         Returns ``None`` for a miss or a hit on any non-atom prop.
         """
-        if actor is None or actor is not self._atom_actor or len(self._positions) == 0:
+        if actor is None or len(self._positions) == 0:
+            return None
+        if actor is not self._atom_actor and actor is not self._adp_actor:
             return None
         _dist, index = cKDTree(self._positions).query(np.asarray(world_pos, dtype=float))
         return int(index)
@@ -302,13 +428,18 @@ class StructureRenderer:
         return self.periodic_image_indices(index)
 
     def preview_atom_position(self, index: int, world_pos: np.ndarray) -> None:
-        """Move an atom's sphere live (with its move group), not the model.
+        """Move an atom live (with its move group), not the model.
 
-        Used during an interactive drag: the dragged sphere follows the cursor and
+        Used during an interactive drag: the dragged atom follows the cursor and
         every atom in its move group (periodic images, plus the rest of a
         multi-atom selection) moves by the same cartesian shift. The model is
         updated once on drop; bonds redraw with the ensuing ``refresh``. Does not
         call ``render`` — the caller does.
+
+        "The atom" may be a sphere or a thermal ellipsoid — when ADPs are shown
+        the ellipsoid *is* the atom, and it is what the user grabbed, so it has
+        to be what follows the cursor. Its shape and orientation don't change:
+        moving an atom doesn't alter its displacement tensor.
         """
         world_pos = np.asarray(world_pos, dtype=float)
         base = np.asarray(self._structure.positions, dtype=float)
@@ -322,10 +453,8 @@ class StructureRenderer:
             if i in self._highlight_actors:
                 self._highlight_actors[i].SetPosition(*delta)
         self._reglyph_atoms()
-        # keep the bonds attached to the dragged atoms (small systems only)
-        if len(self._positions) <= _LIVE_BOND_MAX_ATOMS:
-            self._update_bonds(self._positions)
-            self._update_hydrogen_bonds()
+        self._update_adp_ellipsoids(self._positions)
+        self._update_live_bonds()  # keep the bonds attached to the dragged atoms
 
     def highlight(self, indices) -> None:
         """Draw translucent halos around the selected atoms.
@@ -409,6 +538,8 @@ class StructureRenderer:
         self._ensure_lights()
         self._apply_scene_settings()
         self._atom_actor = None
+        self._atom_mesh_obj = None
+        self._atom_follow = None
         self._positions = np.empty((0, 3), dtype=float)
         self._numbers = np.empty(0, dtype=int)
         self._radii = np.empty(0, dtype=float)
@@ -424,6 +555,11 @@ class StructureRenderer:
         self._polyhedra_follow = None
         self._polyhedra_edge_follow = None
         self._label_actor = None
+        self._arrow_actor = None
+        self._adp_actor = None
+        self._adp_mesh_obj = None
+        self._adp_follow = None
+        self._ellipsoid_mask = None  # settings/geometry may have changed under it
         self._annotation_actors = []  # plotter.clear() dropped them; _draw_annotations re-adds
         self._highlight_actors = {}
         if self._structure is None or len(self._structure) == 0:
@@ -436,13 +572,19 @@ class StructureRenderer:
         self._positions = np.asarray(struct.positions, dtype=float)
         self._numbers = np.asarray(struct.numbers, dtype=int)
         self._radii = _sphere_radius(self._numbers, settings.atom_scale)
+        self._draw_adp_ellipsoids()  # decides which atoms _draw_atoms skips
         self._draw_atoms()
 
         if settings.show_bonds:
             self._draw_bonds(self._positions, self._numbers)
         if settings.show_hydrogen_bonds:
             self._draw_hydrogen_bonds()
-        if settings.show_polyhedra:
+        # A coordination polyhedron is a large translucent solid centred on an
+        # atom, and an ADP ellipsoid is a couple of tenths of an Angstrom sitting
+        # inside it — the polyhedron swallows it whole. When the ellipsoids are
+        # on screen they are the thing being looked at, so the polyhedra stand
+        # down; the setting is left alone, so they return when the ellipsoids go.
+        if settings.show_polyhedra and self._adp_actor is None:
             self._draw_polyhedra()
         if settings.show_cell:
             self._draw_cell()
@@ -450,6 +592,7 @@ class StructureRenderer:
             self._draw_lattice_vectors()
         if settings.show_atom_labels:
             self._draw_atom_labels()
+        self._draw_mode_arrows()  # the selected mode's eigenvector, if one is set
         self._draw_annotations()  # measurements survive a rebuild (plotter.clear())
         self._restore_camera(saved_camera)
         self.plotter.render()
@@ -489,16 +632,47 @@ class StructureRenderer:
 
     def _build_atom_glyph_actor(self):
         """Build the atom glyph: a unit sphere replicated at every atom, scaled
-        by covalent radius and coloured per element, as one actor."""
+        by covalent radius and coloured per element, as one actor.
+
+        Atoms drawn as thermal ellipsoids are left out — the ellipsoid *is* the
+        atom there, and a covalent-radius sphere would swallow it whole (an ADP
+        ellipsoid is a couple of tenths of an Angstrom across, a drawn atom
+        several times that).
+
+        The replication is done here rather than by ``PolyData.glyph`` so that the
+        point order is ours by construction: that is what lets
+        :meth:`_reglyph_atoms` move the spheres by writing the point array, with
+        no filter to re-run and no actor to replace. Same mesh either way — one
+        sphere triangulation per atom, scaled by its radius, coloured by element.
+        """
+        self._atom_mesh_obj = None
+        self._atom_follow = None
+        shown = self._sphere_atoms()
+        if not shown.any():
+            return None
         resolution = _sphere_resolution(len(self._numbers))
-        cloud = pv.PolyData(self._positions)
-        cloud["radius"] = self._radii
-        cloud["rgb"] = self._rgb_for(self._numbers)
-        geom = pv.Sphere(radius=1.0, theta_resolution=resolution, phi_resolution=resolution)
-        # scale each sphere by its atom's covalent radius; don't orient by normals
-        glyph = cloud.glyph(geom=geom, scale="radius", orient=False)
+        template = pv.Sphere(radius=1.0, theta_resolution=resolution, phi_resolution=resolution)
+        unit = np.asarray(template.points, dtype=float)
+        template_faces = np.asarray(template.faces, dtype=np.int64).reshape(-1, 4)
+
+        index = np.nonzero(shown)[0]
+        # (n_shown, n_unit, 3): each atom's sphere, scaled by its own radius. This
+        # is also the per-vertex offset from its atom, which is what stays
+        # constant while the atoms move.
+        offsets = self._radii[index][:, None, None] * unit[None, :, :]
+        points = (self._positions[index][:, None, :] + offsets).reshape(-1, 3)
+
+        faces = np.tile(template_faces, (len(index), 1))
+        faces[:, 1:] += np.repeat(
+            np.arange(len(index)) * len(unit), len(template_faces)
+        )[:, None]
+
+        mesh = pv.PolyData(points, faces.ravel())
+        mesh["rgb"] = np.repeat(self._rgb_for(self._numbers[index]), len(unit), axis=0)
+        self._atom_mesh_obj = mesh
+        self._atom_follow = (np.repeat(index, len(unit)), offsets.reshape(-1, 3))
         return self.plotter.add_mesh(
-            glyph,
+            mesh,
             scalars="rgb",
             rgb=True,
             opacity=self._settings.atom_opacity,
@@ -507,10 +681,27 @@ class StructureRenderer:
         )
 
     def _reglyph_atoms(self) -> None:
-        """Rebuild the atom glyph in place after positions changed (no render)."""
+        """Move the drawn atoms onto the current positions (no render).
+
+        Writes the mesh's point array — every sphere keeps its size, colour and
+        triangulation, only its centre moves — instead of dropping the actor and
+        building a fresh glyph. This runs on every animation frame and every drag
+        mouse-move, where the teardown-and-rebuild was the single largest cost:
+        ~10 ms even for 64 atoms, nearly all of it pyvista/VTK pipeline overhead
+        rather than geometry.
+
+        Falls back to a rebuild if the follow map no longer fits the positions,
+        so a caller that changed the atom count still gets a correct picture.
+        """
+        follow = self._atom_follow
+        if self._atom_mesh_obj is not None and follow is not None:
+            index, offset = follow
+            if len(index) == 0 or int(index.max()) < len(self._positions):
+                self._atom_mesh_obj.points = self._positions[index] + offset
+                return
         if self._atom_actor is not None:
             self.plotter.remove_actor(self._atom_actor, render=False)
-            self._atom_actor = None
+        self._atom_actor = None
         if len(self._positions):
             self._atom_actor = self._build_atom_glyph_actor()
 
@@ -576,6 +767,28 @@ class StructureRenderer:
             mesh, color=_HBOND_COLOR, line_width=_HBOND_LINE_WIDTH, render=False
         )
         self._hbond_actor.SetPickable(False)  # not a pick target
+
+    def _update_live_bonds(self) -> None:
+        """Refresh the bond meshes for a live position change (no render here).
+
+        Shared by both live paths — the animation's ``update_positions`` and the
+        drag's ``preview_atom_position`` — so their size limits cannot drift
+        apart. They had: the drag ran the hydrogen-bond scan on anything up to
+        ``_LIVE_BOND_MAX_ATOMS`` (5000), skipping the far tighter limit that scan
+        needs, which cost ~140 ms *per mouse-move event* on a 2400-atom hydrated
+        cell and made dragging an atom there unusable.
+
+        Above the covalent limit the bonds are left in place and refresh on
+        commit, as documented on ``_LIVE_BOND_MAX_ATOMS``.
+        """
+        if len(self._positions) > _LIVE_BOND_MAX_ATOMS:
+            return
+        self._update_bonds(self._positions)
+        # The hydrogen-bond scan is the expensive one; a frozen topology makes it
+        # a gather, so only the unfrozen path needs the tighter limit.
+        frozen = self._frozen_hbond_pairs is not None or self._bond_reference is not None
+        if frozen or len(self._positions) <= _LIVE_HBOND_MAX_ATOMS:
+            self._update_hydrogen_bonds()
 
     def _update_hydrogen_bonds(self) -> None:
         """Redraw the hydrogen bonds for the current positions (no render here)."""
@@ -872,56 +1085,328 @@ class StructureRenderer:
         self._cell_actor = self.plotter.add_mesh(edges, color="#3355aa", line_width=2)
         self._cell_actor.SetPickable(False)
 
-    def _draw_lattice_vectors(self) -> None:
-        """Draw small a/b/c arrows (red/green/blue) as a gizmo below the structure.
+    # ── thermal ellipsoids (ADP) ────────────────────────────────────────
+    def _ellipsoid_atoms(self) -> np.ndarray:
+        """Boolean mask of the atoms that get a thermal ellipsoid.
 
-        Placed just outside the structure's lower corner — not at the cell origin
-        — so the arrows don't lie on top of the cell edges.
+        Cached: the mask depends on the tensors, the probability and the toggle —
+        never on where the atoms currently *are* — but it is consulted on every
+        re-glyph, which happens per animation frame and per drag mouse-move.
+        Recomputing it there diagonalised every tensor again for nothing. The
+        cache is dropped by :meth:`_rebuild` and :meth:`set_adp_tensors`, which
+        between them cover every way an input can change.
+        """
+        if self._ellipsoid_mask is None:
+            self._ellipsoid_mask = self._compute_ellipsoid_atoms()
+        return self._ellipsoid_mask
+
+    def _compute_ellipsoid_atoms(self) -> np.ndarray:
+        """Which atoms qualify for an ellipsoid (see :meth:`_ellipsoid_atoms`).
+
+        An atom qualifies when ellipsoids are switched on, a tensor for it is
+        loaded, and that tensor is big enough to draw. A tensor that is all but
+        zero — an atom the sampling says doesn't move, or a non-positive-definite
+        one clamped flat — is left to its ordinary sphere rather than rendered as
+        an invisible speck.
+        """
+        blank = np.zeros(len(self._positions), dtype=bool)
+        if not self._settings.show_adp_ellipsoids or self._adp_tensors is None:
+            return blank
+        if self._adp_tensors.shape != (len(self._positions), 3, 3):
+            return blank  # tensors and displayed geometry out of step
+        return self._adp_radii()[:, 2] >= _MIN_ELLIPSOID_RADIUS
+
+    def _sphere_atoms(self) -> np.ndarray:
+        """Boolean mask of the atoms drawn as plain spheres (the rest)."""
+        return ~self._ellipsoid_atoms()
+
+    def _adp_radii(self) -> np.ndarray:
+        """``(natom, 3)`` ascending semi-axis lengths at the set probability."""
+        from crystalline.core.adp import ellipsoid_radii
+
+        return ellipsoid_radii(self._adp_tensors, self._settings.adp_probability)
+
+    def set_adp_tensors(self, tensors: Optional[np.ndarray], redraw: bool = True) -> None:
+        """Supply ``(natom, 3, 3)`` cartesian ADP tensors (Å²), or ``None``.
+
+        Only stores them; whether they are drawn and at what probability is a
+        display setting. A set that doesn't match the displayed atom count is
+        kept but not drawn, so switching cell view or supercell doesn't silently
+        discard the file's ADPs.
+
+        ``redraw=False`` stages the tensors for a rebuild the caller is about to
+        trigger anyway — changing the temperature changes both these tensors and
+        the settings, and rebuilding twice makes the view flicker.
+        """
+        self._adp_tensors = None if tensors is None else np.asarray(tensors, dtype=float)
+        self._ellipsoid_mask = None  # a new tensor set decides anew who gets one
+        if redraw:
+            self._rebuild()
+
+    def _draw_adp_ellipsoids(self) -> None:
+        """One merged mesh holding every atom's displacement ellipsoid.
+
+        Each ellipsoid is a unit sphere stretched along the tensor's principal
+        axes: a point ``y`` on the sphere maps to ``centre + (y * radii) @ axes``
+        because ``axes`` holds the principal directions as rows. The spheres
+        share one triangulation, so the whole field is built by transforming
+        points and re-offsetting the same face table — one actor, as for atoms.
+        """
+        from crystalline.core.adp import ellipsoid_axes
+
+        shown = self._ellipsoid_atoms()
+        if not shown.any():
+            return
+        resolution = _sphere_resolution(len(self._numbers))
+        template = pv.Sphere(radius=1.0, theta_resolution=resolution, phi_resolution=resolution)
+        unit = np.asarray(template.points, dtype=float)
+        faces = np.asarray(template.faces, dtype=np.int64).reshape(-1, 4)
+        rgb = self._rgb_for(self._numbers)
+
+        points, all_faces, colors = [], [], []
+        for offset, index in enumerate(np.nonzero(shown)[0]):
+            radii, axes, _pd = ellipsoid_axes(
+                self._adp_tensors[index], self._settings.adp_probability
+            )
+            points.append(self._positions[index] + (unit * radii) @ axes)
+            block = faces.copy()
+            block[:, 1:] += offset * len(unit)
+            all_faces.append(block)
+            colors.append(np.repeat(rgb[index][None, :], len(unit), axis=0))
+
+        mesh = pv.PolyData(np.vstack(points), np.vstack(all_faces).ravel())
+        mesh["rgb"] = np.vstack(colors)
+        # Which atom each vertex belongs to, and where it sits relative to it, so
+        # an animation can carry the ellipsoids along without rebuilding them:
+        # the tensor is fixed through a vibration, only the centre moves.
+        self._adp_mesh_obj = mesh
+        self._adp_follow = (
+            np.repeat(np.nonzero(shown)[0], len(unit)),
+            np.vstack([block - self._positions[i]
+                       for i, block in zip(np.nonzero(shown)[0], points)]),
+        )
+        self._adp_actor = self.plotter.add_mesh(
+            mesh,
+            scalars="rgb",
+            rgb=True,
+            opacity=self._settings.adp_opacity,
+            render=False,
+            **_ATOM_MATERIAL,
+        )
+
+    def _update_adp_ellipsoids(self, positions: np.ndarray) -> None:
+        """Slide the ellipsoids onto ``positions`` (an animation frame).
+
+        A vibration moves the atoms without changing their displacement tensors,
+        so each ellipsoid keeps its shape and orientation and only its centre
+        moves — a point translation, not a rebuild.
+        """
+        if self._adp_mesh_obj is None or self._adp_follow is None:
+            return
+        index, offset = self._adp_follow
+        self._adp_mesh_obj.points = positions[index] + offset
+
+    # ── phonon displacement arrows ──────────────────────────────────────
+    def _redraw_mode_arrows(self) -> None:
+        """Rebuild the arrow field in place (no render — the caller does that)."""
+        if self._arrow_actor is not None:
+            self.plotter.remove_actor(self._arrow_actor, render=False)
+            self._arrow_actor = None
+        self._draw_mode_arrows()
+
+    def _draw_mode_arrows(self) -> None:
+        """One glyphed actor holding every displacement arrow.
+
+        Arrows start at the atoms as currently *drawn*, so they travel with the
+        atoms through an animation instead of hanging in space. Every arrow is
+        the same length: it shows which way an atom moves, not how far. Scaling
+        by displacement instead would leave the arrows of a delocalised mode —
+        where no atom stands out — as a field of specks, and in a mode dominated
+        by one hydrogen it would erase every other atom's direction entirely.
+
+        How far each atom moves is still readable, in two better places: the
+        animation itself, and the composition line in the Phonons panel. What
+        the arrows add is direction, and direction reads best at one size.
+
+        Atoms barely involved in the mode get no arrow at all — below a small
+        fraction of the largest displacement, a full-length arrow would claim a
+        motion that isn't there.
+        """
+        if not self._settings.show_mode_arrows or self._mode_vectors is None:
+            return
+        vectors = self._mode_vectors
+        if vectors.shape != self._positions.shape or len(vectors) == 0:
+            return  # modes and displayed geometry out of step
+        lengths = np.linalg.norm(vectors, axis=1)
+        peak = float(lengths.max()) if len(lengths) else 0.0
+        if peak <= 0.0:
+            return  # a null mode has nothing to draw
+        keep = lengths >= _MIN_ARROW_FRACTION * peak
+        if not keep.any():
+            return
+
+        cloud = pv.PolyData(self._positions[keep])
+        # Direction only: unit vectors, all drawn at the one configured length.
+        directions = vectors[keep] / lengths[keep, None]
+        cloud["vectors"] = directions * self._settings.mode_arrow_scale
+        # factor=1: the glyph is already scaled to Angstrom by "vectors" above.
+        # Radii are fractions of the arrow's own length, so a short arrow stays
+        # proportioned rather than degenerating into a line.
+        glyph = cloud.glyph(geom=pv.Arrow(tip_length=0.3, tip_radius=0.13, shaft_radius=0.05),
+                            orient="vectors", scale="vectors", factor=1.0)
+        self._arrow_actor = self.plotter.add_mesh(
+            glyph, color=self._settings.mode_arrow_color, smooth_shading=True, render=False
+        )
+        self._arrow_actor.SetPickable(False)  # only atoms are pick targets
+
+    def _draw_lattice_vectors(self) -> None:
+        """Pin the a/b/c gizmo to a fixed corner of the viewport.
+
+        It used to be an ordinary set of arrows anchored below the structure's
+        lower corner. That put it at a *world* position, so every camera change
+        moved it: the three axis-alignment views each showed it somewhere
+        different, which is exactly what a gizmo must not do.
+
+        A VTK orientation-marker widget instead lives in screen space — always
+        the same corner, always the same size — and only turns to follow the
+        camera. It is built from the real lattice vectors rather than a stock
+        xyz marker, so a non-orthogonal cell shows its true angles (a hexagonal
+        cell's a and b really do come out 120 degrees apart).
+
+        The widget survives ``plotter.clear()``, unlike an actor, so it is
+        created once and only its marker is swapped when the cell changes.
+        """
+        marker = self._lattice_marker()
+        if marker is None:
+            self._set_orientation_widget(None)
+            return
+        self._set_orientation_widget(marker)
+
+    def _lattice_marker(self):
+        """A prop assembly of labelled a/b/c arrows, or ``None`` if there's no cell.
+
+        One arrow per *periodic* direction only: a slab shows a and b, a polymer
+        just a — never a spurious c along CRYSTAL's formal 500 Å vacuum vector.
+        The arrows share one length, so the gizmo shows orientation alone and
+        never rescales with the lattice parameters.
         """
         if self._structure is None or not self._structure.is_periodic:
-            return
+            return None
         cell = self._reference_cell if self._reference_cell is not None else self._structure.cell
         cell = np.asarray(cell, dtype=float)
         if np.allclose(cell, 0.0):
-            return
-        # All three arrows share one fixed length, so the gizmo indicates only
-        # orientation and never rescales when the lattice parameters change.
-        arrow_length = _LATTICE_ARROW_LENGTH
-        # Anchor the gizmo below the lowest atom, offset far enough that the
-        # arrows clear the cell rather than overlapping its edges.
-        pad = 1.3 * arrow_length
-        base = self._structure.positions.min(axis=0) - pad
-        tips = []
-        labels = []
-        # One arrow per periodic direction only: a slab shows a/b, a polymer just a
-        # — never a spurious c arrow along CRYSTAL's formal 500 Å vacuum vector.
-        for axis, p in enumerate(self._structure.pbc):
-            if not p:
+            return None
+
+        # vtkPropAssembly, not vtkAssembly: the latter pokes its own matrix into
+        # every child, which overrides anything a child computes for itself. A
+        # prop assembly just groups props and lets each render on its own terms,
+        # which is what the 2D labels below need.
+        assembly = vtk.vtkPropAssembly()
+        drawn = 0
+        for axis, periodic in enumerate(self._structure.pbc):
+            if not periodic:
                 continue
             vec = cell[axis]
             length = float(np.linalg.norm(vec))
             if length < 1e-6:
                 continue
-            arrow = pv.Arrow(start=base, direction=vec, scale=arrow_length)
-            actor = self.plotter.add_mesh(arrow, color=_LATTICE_COLORS[axis], render=False)
-            actor.SetPickable(False)  # gizmo, never a pick target
-            tips.append(base + (vec / length) * arrow_length)
-            labels.append(_LATTICE_LABELS[axis])
-        if tips:
-            labels = self.plotter.add_point_labels(
-                np.asarray(tips, dtype=float),
-                labels,
-                font_size=14,
-                show_points=False,
-                shape=None,
-                always_visible=True,
-                pickable=False,
-                render=False,
+            direction = vec / length
+            arrow = pv.Arrow(
+                start=(0.0, 0.0, 0.0), direction=direction, scale=_LATTICE_ARROW_LENGTH
             )
-            labels.SetPickable(False)
+            assembly.AddPart(_unlit_actor(arrow, _LATTICE_COLORS[axis]))
+            assembly.AddPart(
+                _axis_label_actor(
+                    _LATTICE_LABELS[axis],
+                    direction * _LATTICE_ARROW_LENGTH * _LATTICE_LABEL_OFFSET,
+                    _LATTICE_COLORS[axis],
+                )
+            )
+            drawn += 1
+        if not drawn:
+            return None
+        assembly.AddPart(_bounds_padding_actor(_LATTICE_ARROW_LENGTH * _GIZMO_BOUNDS_PADDING))
+        return assembly
+
+    def _set_orientation_widget(self, marker) -> None:
+        """Show ``marker`` in the viewport corner (``None`` hides the gizmo)."""
+        if marker is None:
+            if self._orientation_widget is not None:
+                self._orientation_widget.SetEnabled(0)
+            return
+        if self._orientation_widget is None:
+            try:
+                self._orientation_widget = self.plotter.add_orientation_widget(
+                    marker, viewport=_GIZMO_VIEWPORT
+                )
+            except Exception:  # noqa: BLE001 - no interactor (bare off-screen plotter)
+                    self._orientation_widget = None
+            return
+        self._orientation_widget.SetOrientationMarker(marker)
+        self._orientation_widget.SetEnabled(1)
 
 
 # ── free helpers ─────────────────────────────────────────────────────────
+def _unlit_actor(mesh, color: str):
+    """A flat-shaded actor for ``mesh`` — a gizmo reads best without lighting."""
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetInputData(mesh)
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    actor.GetProperty().SetColor(*(c / 255.0 for c in _hex_to_rgb(color)))
+    actor.GetProperty().SetLighting(False)
+    actor.SetPickable(False)
+    return actor
+
+
+def _bounds_padding_actor(radius: float):
+    """An invisible sphere that only exists to widen the gizmo's bounds."""
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetInputData(pv.Sphere(radius=radius, theta_resolution=8, phi_resolution=8))
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    actor.GetProperty().SetOpacity(0.0)
+    actor.SetPickable(False)
+    return actor
+
+
+def _axis_label_actor(text: str, position: np.ndarray, color: str):
+    """A screen-aligned "a"/"b"/"c" pinned to the 3D point ``position``.
+
+    A ``vtkCaptionActor2D``: the glyph is drawn in the image plane but anchored
+    to a world point, so it tracks its arrow tip while staying upright and the
+    same size. This is what ``vtkAxesActor`` does for its own labels.
+
+    3D text does not work here. Rendered as geometry it turns edge-on and
+    vanishes whenever the axis it labels points at the viewer — precisely the
+    situation in each of the a/b/c alignment views — and a ``vtkFollower``,
+    which would normally swivel to face the camera, cannot fix it inside an
+    assembly whose matrix is imposed on its children.
+    """
+    caption = vtk.vtkCaptionActor2D()
+    caption.SetCaption(text)
+    caption.SetAttachmentPoint(*np.asarray(position, dtype=float))
+    caption.BorderOff()
+    caption.LeaderOff()
+    caption.ThreeDimensionalLeaderOff()
+    caption.SetPadding(0)
+    # A caption sizes its text to its own box, so the box is what sets the glyph
+    # size; left at the default it would dwarf the arrows.
+    caption.SetWidth(_LATTICE_LABEL_BOX)
+    caption.SetHeight(_LATTICE_LABEL_BOX)
+
+    text_property = caption.GetCaptionTextProperty()
+    text_property.SetColor(*(c / 255.0 for c in _hex_to_rgb(color)))
+    text_property.SetFontSize(_LATTICE_LABEL_FONT_SIZE)
+    text_property.BoldOn()
+    text_property.ItalicOff()
+    text_property.ShadowOff()
+    text_property.SetJustificationToCentered()
+    text_property.SetVerticalJustificationToCentered()
+    caption.SetPickable(False)
+    return caption
+
+
 def _sphere_radius(z, scale: float = _ATOM_SCALE):
     """Drawn sphere radius for atomic number(s) ``z`` (scalar or array in → same out)."""
     return covalent_radii[z] * scale
@@ -1140,6 +1625,22 @@ def _hull_mesh(polyhedra, overrides: Optional[dict] = None) -> Optional[pv.PolyD
     Each entry's ligands become a convex-hull polyhedron coloured by the central
     atom (honouring any ``overrides`` colour map); coplanar/degenerate sets are
     skipped. Returns ``None`` if nothing drawable.
+
+    The hulls are concatenated by hand — points stacked, each hull's triangle
+    indices shifted by the points already placed — rather than by folding
+    ``PolyData.merge`` over them. That fold re-copied the whole accumulated mesh
+    once per polyhedron, so the cost grew as the square of their number and
+    dominated every redraw: a 1728-atom cell (864 hulls) spent 1.6 s of a 1.66 s
+    rebuild in it. Building the arrays directly is the same operation in one pass
+    and ~47x faster there, and it is what ``_draw_adp_ellipsoids`` already does
+    for the ellipsoid field.
+
+    Points are deliberately *not* welded (the old call passed
+    ``merge_points=False``): neighbouring polyhedra share ligand atoms, and
+    fusing those vertices would join two independent solids — the shared edge
+    turns non-manifold and drops out of the outline, and shading bleeds from one
+    polyhedron into the next. Keeping each hull's own copy of its points
+    preserves that.
     """
     from scipy.spatial import ConvexHull
 
@@ -1148,7 +1649,10 @@ def _hull_mesh(polyhedra, overrides: Optional[dict] = None) -> Optional[pv.PolyD
     except ImportError:  # pragma: no cover - older scipy
         from scipy.spatial.qhull import QhullError
 
-    meshes = []
+    points: list = []
+    faces: list = []
+    colors: list = []
+    offset = 0
     for center_z, ligands in polyhedra:
         pts = np.asarray(ligands, dtype=float)
         if len(pts) < 4:
@@ -1157,21 +1661,21 @@ def _hull_mesh(polyhedra, overrides: Optional[dict] = None) -> Optional[pv.PolyD
             hull = ConvexHull(pts)
         except (QhullError, ValueError):
             continue  # coplanar / too few independent points
-        faces = np.hstack([[3, *tri] for tri in hull.simplices]).astype(np.int64)
-        poly = pv.PolyData(pts, faces)
-        color = np.tile(_center_rgb(center_z, overrides), (poly.n_points, 1))
-        poly["colors"] = color.astype(np.uint8)
-        meshes.append(poly)
+        triangles = np.asarray(hull.simplices, dtype=np.int64)
+        # VTK face table: each cell is [n_vertices, v0, v1, v2], and this hull's
+        # vertices start at `offset` in the concatenated point array.
+        block = np.empty((len(triangles), 4), dtype=np.int64)
+        block[:, 0] = 3
+        block[:, 1:] = triangles + offset
+        points.append(pts)
+        faces.append(block)
+        colors.append(np.tile(_center_rgb(center_z, overrides), (len(pts), 1)))
+        offset += len(pts)
 
-    if not meshes:
+    if not points:
         return None
-    merged = meshes[0]
-    for extra in meshes[1:]:
-        # merge_points=False: neighbouring polyhedra share ligand atoms, and
-        # welding those vertices would fuse two independent solids — the shared
-        # edge turns non-manifold and drops out of the outline, and shading
-        # bleeds from one polyhedron into the next.
-        merged = merged.merge(extra, merge_points=False)
+    merged = pv.PolyData(np.vstack(points), np.vstack(faces).ravel())
+    merged["colors"] = np.vstack(colors).astype(np.uint8)
     # Qhull doesn't wind its simplices consistently, so adjacent triangles can
     # come out with opposing normals — which shades the facets unevenly and, in
     # ``extract_feature_edges``, makes every edge look like a fold (a cube's 6

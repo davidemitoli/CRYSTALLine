@@ -23,6 +23,7 @@ from typing import Optional
 import numpy as np
 from ase import Atoms
 
+from crystalline.core.adp import ADPSet
 from crystalline.core.phonons import PhononMode, PhononModes
 from crystalline.core.structure import Structure
 
@@ -122,7 +123,7 @@ def load_phonons(
     out = Crystal_output(path)
     out.get_phonon(read_eigvt=True, rm_imaginary=not keep_imaginary)
 
-    structure = Structure.from_ase(_pmg_to_ase(out.get_geometry(initial=False)))
+    structure = Structure.from_ase(_out_geometry_to_ase(out, initial=False))
     natom = len(structure)
 
     # frequency: (nqpoint, nmode) in THz -> converted to cm^-1 below.
@@ -153,6 +154,27 @@ def load_phonons(
     ]
 
     return structure, PhononModes(modes)
+
+
+def load_adp(path: str) -> Optional[ADPSet]:
+    """Load the atomic displacement parameters of a CRYSTAL ``.out``.
+
+    Returns ``None`` — never raises — when the file has no ``ADP`` section,
+    which is the common case: a frequency run only computes them if asked. The
+    tensors come back cartesian and in Angstrom squared, on the same atom
+    ordering as :func:`load_structure`.
+    """
+    if _is_gui(path) or _is_cif(path):
+        return None
+    try:
+        from CRYSTALClear.crystal_io import Crystal_output
+
+        out = Crystal_output(path).get_ADP()
+    except Exception:  # noqa: BLE001 - absent section, or an output it can't read
+        return None
+    if out.adp.size == 0 or len(out.adp_temperature) == 0:
+        return None
+    return ADPSet(temperatures=out.adp_temperature, tensors=out.adp)
 
 
 def _per_mode(values, nmode: int, cast=bool) -> list:
@@ -436,8 +458,35 @@ def _is_cif(path: str) -> bool:
 def _out_to_ase(path: str, initial: bool) -> Atoms:
     from CRYSTALClear.crystal_io import Crystal_output
 
-    geom = Crystal_output(path).get_geometry(initial=initial)
-    return _pmg_to_ase(geom)
+    return _out_geometry_to_ase(Crystal_output(path), initial=initial)
+
+
+def _out_geometry_to_ase(out, initial: bool) -> Atoms:
+    """The geometry of an open ``Crystal_output``, with its true dimensionality.
+
+    ``get_geometry`` returns a pymatgen ``Structure``, which is 3D-periodic by
+    construction: a 2D slab comes back flagged periodic along c as well, where
+    CRYSTAL has put a formal 500 Å vacuum vector. Consumers that trust ``pbc``
+    then treat that vacuum as a real lattice direction — the cell is drawn 500 Å
+    tall, and CrystalNN's Voronoi tessellation hangs on it. CRYSTAL states the
+    dimensionality in the output, so use it (as the ``.gui`` reader already does).
+    """
+    atoms = _pmg_to_ase(out.get_geometry(initial=initial))
+    atoms.set_pbc(_out_pbc(out))
+    return atoms
+
+
+def _out_pbc(out) -> tuple:
+    """CRYSTAL dimensionality as ase ``pbc`` — 3=bulk, 2=slab, 1=polymer, 0=molecule.
+
+    Falls back to fully periodic if the output doesn't state a dimensionality,
+    which is what every consumer assumed before.
+    """
+    try:
+        dim = int(out.get_dimensionality())
+    except Exception:  # noqa: BLE001 - absent/unparsable: keep the old assumption
+        return (True, True, True)
+    return (dim >= 1, dim >= 2, dim >= 3)
 
 
 def _cif_to_ase(path: str) -> Atoms:
@@ -476,6 +525,7 @@ def _gui_to_ase(path: str) -> Atoms:
 
 
 __all__ = [
+    "load_adp",
     "load_structure",
     "load_phonons",
     "save_structure_gui",

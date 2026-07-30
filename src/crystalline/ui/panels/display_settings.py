@@ -15,7 +15,7 @@ from typing import Callable, Optional
 
 from ase.data import chemical_symbols
 from ase.data.colors import jmol_colors
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -37,6 +37,28 @@ from PySide6.QtWidgets import (
 from crystalline.viz.render_settings import RenderSettings
 
 
+# Probability levels offered for the ellipsoid surface. 50% is what ORTEP and
+# every structure report use; the higher ones are for seeing a small tensor.
+_ADP_PROBABILITIES = (0.50, 0.75, 0.90, 0.99)
+
+# How long a *continuous* control (a slider or its spin box) waits for the drag
+# to settle before reporting the change. A slider spans 1000 steps, so dragging
+# one across its range emits hundreds of times, and each of those can cost the
+# renderer a full scene rebuild — dragging "Atom size" on a 1728-atom cell used
+# to take 16 s for ten ticks. Coalescing to ~16 updates a second still tracks the
+# thumb closely enough to feel live while collapsing the rest.
+#
+# Only the continuous rows debounce. Checkboxes, combos and colour pickers fire
+# once per click, so waiting would add latency for nothing; they emit
+# immediately, flushing any pending tick first so changes never arrive reordered.
+_SLIDER_SETTLE_MS = 60
+
+
+def _closest_index(values, target: float) -> int:
+    """The entry of ``values`` nearest ``target`` — settings needn't be exact."""
+    return min(range(len(values)), key=lambda i: abs(values[i] - target))
+
+
 def _jmol_hex(z: int) -> str:
     """The default Jmol colour of element ``z`` as ``#rrggbb``."""
     r, g, b = (int(round(c * 255)) for c in jmol_colors[int(z)])
@@ -55,10 +77,21 @@ class DisplayPanel(QWidget):
         super().__init__(parent)
         self._on_change = on_change
         self._loading = True
+        # Coalesces the stream of changes a slider drag produces (see
+        # _SLIDER_SETTLE_MS). Single-shot: each tick restarts the wait, so the
+        # emit happens once the drag pauses.
+        self._settle = QTimer(self)
+        self._settle.setSingleShot(True)
+        self._settle.setInterval(_SLIDER_SETTLE_MS)
+        self._settle.timeout.connect(self._emit)
         self._bg_color = settings.background_color
         self._measure_point_color = settings.measure_point_color
         self._measure_line_color = settings.measure_line_color
         self._measure_plane_color = settings.measure_plane_color
+        self._mode_arrow_color = settings.mode_arrow_color
+        # Which temperature to select the first time a file brings some. After
+        # that the picker's own index carries across files.
+        self._initial_adp_index = int(settings.adp_temperature_index)
         # Per-element colour overrides {Z: "#rrggbb"} and their swatch buttons.
         self._atom_colors: dict = {int(z): c for z, c in settings.atom_colors}
         self._elem_buttons: dict = {}
@@ -120,6 +153,31 @@ class DisplayPanel(QWidget):
         self._poly_opacity = self._float_row(poly, "Opacity", settings.polyhedra_opacity, 0.05, 1.0, 0.05)
         self._poly_min = self._int_row(poly, "Min. coordination", settings.polyhedra_min_vertices, 3, 12)
 
+        # ── Thermal ellipsoids ── (ADP; only meaningful for a run that has them)
+        adp = self._group(layout, "Thermal ellipsoids (ADP)")
+        self._show_adp = self._check(adp, "Show ellipsoids", settings.show_adp_ellipsoids)
+        self._adp_temp = self._combo(adp, "Temperature", [], 0)
+        self._adp_probability = self._combo(
+            adp, "Probability",
+            [f"{int(p * 100)} %" for p in _ADP_PROBABILITIES],
+            _closest_index(_ADP_PROBABILITIES, settings.adp_probability),
+        )
+        self._adp_probability.setToolTip(
+            "Fraction of the displacement distribution the drawn surface encloses.\n"
+            "50% is the crystallographic convention (ORTEP)."
+        )
+        self._adp_opacity = self._float_row(adp, "Opacity", settings.adp_opacity, 0.05, 1.0, 0.05)
+        self._adp_group = adp
+        self.set_adp_temperatures([])  # nothing loaded yet
+
+        # ── Phonon arrows ── (the selected mode's eigenvector, drawn on the atoms)
+        arrows = self._group(layout, "Phonon displacement arrows")
+        self._show_arrows = self._check(arrows, "Show arrows", settings.show_mode_arrows)
+        self._arrow_scale = self._float_row(
+            arrows, "Arrow length (Å)", settings.mode_arrow_scale, 0.2, 5.0, 0.1
+        )
+        self._arrow_color_btn = self._color_row(arrows, "Colour", "_mode_arrow_color")
+
         # ── Measurements ── (Geometry panel overlays: dots, paths, plane patches)
         measure = self._group(layout, "Measurements")
         self._measure_point_btn = self._color_row(measure, "Dots", "_measure_point_color")
@@ -171,7 +229,7 @@ class DisplayPanel(QWidget):
             guard["lock"] = True
             slider.setValue(to_slider(v))
             guard["lock"] = False
-            self._emit()
+            self._emit_soon()
 
         def on_slider(s: int) -> None:
             if guard["lock"]:
@@ -179,7 +237,7 @@ class DisplayPanel(QWidget):
             guard["lock"] = True
             box.setValue(from_slider(s))
             guard["lock"] = False
-            self._emit()
+            self._emit_soon()
 
         box.valueChanged.connect(on_box)
         slider.valueChanged.connect(on_slider)
@@ -193,10 +251,12 @@ class DisplayPanel(QWidget):
         return box
 
     def _int_row(self, form, label, value, lo, hi) -> QSpinBox:
+        # Debounced like the sliders: holding a spin box's arrow auto-repeats, and
+        # "Min. coordination" re-runs the coordination analysis on every step.
         box = QSpinBox()
         box.setRange(lo, hi)
         box.setValue(value)
-        box.valueChanged.connect(self._emit)
+        box.valueChanged.connect(self._emit_soon)
         form.addRow(label, box)
         return box
 
@@ -240,6 +300,50 @@ class DisplayPanel(QWidget):
         text = "#000000" if c.lightnessF() > 0.5 else "#ffffff"
         button.setStyleSheet(f"background-color: {color}; color: {text}; padding: 3px;")
 
+    # ── thermal ellipsoids (rebuilt for each file's temperatures) ───────
+    def set_adp_temperatures(self, labels, autoshow: bool = False) -> None:
+        """List the temperatures the loaded run reported ADPs for.
+
+        An empty list means the file has none, and the whole group is disabled
+        rather than hidden: the controls stay where the user learnt they are,
+        greyed out with a reason.
+
+        ``autoshow`` switches the ellipsoids on — a file that went to the trouble
+        of computing ADPs is a file whose ADPs you want to see. Only the file
+        loader passes it; a cell-view or supercell change re-lists the same
+        temperatures and must not overrule a user who has switched them off.
+        """
+        labels = list(labels)
+        keep = self._adp_temp.currentIndex()
+        if keep < 0:  # never populated: fall back to the index the settings asked for
+            keep = self._initial_adp_index
+        # Save and restore rather than clear: this also runs from __init__, where
+        # the panel is still being built and an emit would read widgets that
+        # don't exist yet.
+        was_loading = self._loading
+        self._loading = True
+        self._adp_temp.clear()
+        self._adp_temp.addItems(labels)
+        if labels:
+            self._adp_temp.setCurrentIndex(min(max(keep, 0), len(labels) - 1))
+        self._loading = was_loading
+
+        available = bool(labels)
+        for row in range(self._adp_group.rowCount()):
+            for role in (QFormLayout.LabelRole, QFormLayout.FieldRole):
+                item = self._adp_group.itemAt(row, role)
+                if item is not None and item.widget() is not None:
+                    item.widget().setEnabled(available)
+        self._show_adp.setToolTip(
+            "" if available else "This output has no ADP data (needs the ADP keyword)"
+        )
+        # Both of these emit, which is the point: one clears stale ellipsoids,
+        # the other draws the new file's.
+        if not available and self._show_adp.isChecked():
+            self._show_adp.setChecked(False)
+        elif available and autoshow and not self._show_adp.isChecked():
+            self._show_adp.setChecked(True)
+
     # ── per-element colours (rebuilt for each structure's elements) ─────
     def set_elements(self, numbers) -> None:
         """Show a colour swatch per distinct element in the current structure."""
@@ -270,7 +374,16 @@ class DisplayPanel(QWidget):
             self._paint_swatch(button, _jmol_hex(z))
         self._emit()
 
+    def _emit_soon(self) -> None:
+        """Report a continuous control's change once the drag settles."""
+        if self._loading:
+            return
+        self._settle.start()  # restarts the wait if one is already running
+
     def _emit(self) -> None:
+        # A discrete control emitting now must not be overtaken by a slider tick
+        # still sitting on the timer, which would push the older settings last.
+        self._settle.stop()
         if self._loading:
             return
         self._on_change(
@@ -290,6 +403,13 @@ class DisplayPanel(QWidget):
                 show_polyhedra=self._show_poly.isChecked(),
                 polyhedra_opacity=self._poly_opacity.value(),
                 polyhedra_min_vertices=self._poly_min.value(),
+                show_adp_ellipsoids=self._show_adp.isChecked(),
+                adp_probability=_ADP_PROBABILITIES[self._adp_probability.currentIndex()],
+                adp_opacity=self._adp_opacity.value(),
+                adp_temperature_index=max(self._adp_temp.currentIndex(), 0),
+                show_mode_arrows=self._show_arrows.isChecked(),
+                mode_arrow_scale=self._arrow_scale.value(),
+                mode_arrow_color=self._mode_arrow_color,
                 measure_point_color=self._measure_point_color,
                 measure_line_color=self._measure_line_color,
                 measure_plane_color=self._measure_plane_color,

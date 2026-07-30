@@ -53,7 +53,13 @@ class _PlotTab(QWidget):
     native-feeling control strip instead of matplotlib's own toolbar.
     """
 
-    def __init__(self, figure, title: str = "plot", parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        figure,
+        title: str = "plot",
+        parent: Optional[QWidget] = None,
+        on_pick=None,
+    ) -> None:
         super().__init__(parent)
 
         # Imported here (not at module load) so the UI package stays importable
@@ -65,6 +71,7 @@ class _PlotTab(QWidget):
 
         self.figure = figure
         self._title = title
+        self._on_pick = on_pick
         # Let the figure re-flow its axes to fill the canvas on every resize,
         # so the plot grows with the panel instead of sitting small inside wide
         # default margins. Guarded: some figures (3D/colorbar) reject an engine.
@@ -91,7 +98,40 @@ class _PlotTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._build_toolbar())
         layout.addWidget(self.canvas, 1)  # stretch: the canvas takes the space
+        if self._on_pick is not None:
+            self.canvas.mpl_connect("button_press_event", self._on_canvas_click)
+            # Connected *after* the toolbar's own cursor handler (built above),
+            # so this one runs last and wins. Setting the cursor once at
+            # construction does not: matplotlib resets it on every mouse move.
+            self.canvas.mpl_connect("motion_notify_event", self._on_canvas_motion)
+            self.canvas.setToolTip("Click a peak to animate the mode that produced it")
         self.canvas.draw_idle()
+
+    def _on_canvas_motion(self, event) -> None:
+        """A pointing hand over the plot area, to advertise that it is clickable.
+
+        Only inside the axes, and only when neither pan nor zoom is armed —
+        those modes own both the drag and the cursor, and showing a hand while
+        the click would pan instead would be a lie.
+        """
+        if str(self._nav.mode):
+            return
+        self.canvas.setCursor(
+            Qt.PointingHandCursor if event.inaxes is not None else Qt.ArrowCursor
+        )
+
+    def _on_canvas_click(self, event) -> None:
+        """Report the clicked x position to the tab's pick handler.
+
+        Only plain clicks inside the axes count: while pan or zoom is armed the
+        drag belongs to matplotlib, and a click that lands on the figure margin
+        has no data coordinate to report.
+        """
+        if event.inaxes is None or event.xdata is None:
+            return
+        if str(self._nav.mode):  # '' when neither pan nor zoom is active
+            return
+        self._on_pick(float(event.xdata))
 
     def _build_toolbar(self) -> QWidget:
         """A slim row of icon buttons driving the hidden matplotlib toolbar."""
@@ -249,10 +289,16 @@ class _PlotTab(QWidget):
         self._sync_mode_buttons()
 
     def _sync_mode_buttons(self) -> None:
-        """Reflect matplotlib's active mode on the pan/zoom buttons."""
+        """Reflect matplotlib's active mode on the pan/zoom buttons.
+
+        Arming pan or zoom also hands the cursor back to matplotlib: a hand left
+        over from before would promise a mode selection where the click now pans.
+        """
         mode = str(self._nav.mode)  # '' / 'pan/zoom' / 'zoom rect'
         self._btn_pan.setChecked(mode == "pan/zoom")
         self._btn_zoom.setChecked(mode == "zoom rect")
+        if mode and self._on_pick is not None:
+            self.canvas.unsetCursor()
 
     def close_figure(self) -> None:
         """Release the matplotlib figure when this tab goes away."""
@@ -292,9 +338,14 @@ class PlotPanel(QWidget):
         self._show_placeholder()
 
     # ── public API ──────────────────────────────────────────────────────
-    def add_figure(self, figure, title: str) -> None:
-        """Add ``figure`` as a new tab titled ``title`` and bring it to front."""
-        tab = _PlotTab(figure, title, self)
+    def add_figure(self, figure, title: str, on_pick=None) -> None:
+        """Add ``figure`` as a new tab titled ``title`` and bring it to front.
+
+        ``on_pick`` — when given, a callable receiving the x data coordinate of
+        each plain click inside the axes. Used to tie a spectrum's peaks back to
+        the modes that produced them.
+        """
+        tab = _PlotTab(figure, title, self, on_pick=on_pick)
         index = self._tabs.addTab(tab, title)
         self._tabs.setCurrentIndex(index)
         self._stack.setCurrentWidget(self._tabs)

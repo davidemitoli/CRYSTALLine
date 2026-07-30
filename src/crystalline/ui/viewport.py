@@ -212,12 +212,19 @@ class Viewport(QWidget):
     def _up_for(dir_hat: np.ndarray, cell: Optional[np.ndarray], axis: int) -> np.ndarray:
         """An up vector roughly perpendicular to the view direction.
 
-        Prefers another lattice vector (its component orthogonal to the view
-        direction) so the cell reads squarely; falls back to a world axis that
+        Uses the *cyclically next* lattice vector (its component orthogonal to
+        the view direction), so the three axis views agree with one another:
+        looking down a puts b up and c to the right, down b puts c up and a to
+        the right, down c puts a up and b to the right. Taking the other vectors
+        in plain index order instead would give the b view a→up, which is the
+        previous axis rather than the next — mirroring that one view against the
+        other two, and sending the a/b/c gizmo to the opposite side of the screen.
+
+        Falls back to the remaining lattice vector, then to a world axis that
         isn't parallel to the view direction.
         """
         if cell is not None:
-            for other in (i for i in range(3) if i != axis):
+            for other in ((axis + 1) % 3, (axis + 2) % 3):
                 vec = np.asarray(cell[other], dtype=float)
                 perp = vec - dir_hat * float(np.dot(vec, dir_hat))
                 if np.linalg.norm(perp) > 1e-3:

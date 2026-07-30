@@ -175,6 +175,21 @@ def _build_view_menu(window) -> None:
     display_action.triggered.connect(window._show_display_panel)
     view_menu.addAction(display_action)
 
+    # Docks close with a × and, without these, stay closed for good. Qt's own
+    # toggleViewAction shows/hides and stays checked in step with the dock, even
+    # when it is closed by its own button rather than from here.
+    panels_menu = view_menu.addMenu("Panels")
+    window._panel_actions = {}
+    for title, dock in window._panel_docks():
+        action = dock.toggleViewAction()
+        action.setText(title)
+        panels_menu.addAction(action)
+        window._panel_actions[title] = action
+    panels_menu.addSeparator()
+    restore_all = QAction("Restore all panels", window)
+    restore_all.triggered.connect(window._restore_all_panels)
+    panels_menu.addAction(restore_all)
+
     view_menu.addSeparator()
     for label, axis in (("Along a axis", 0), ("Along b axis", 1), ("Along c axis", 2)):
         action = QAction(label, window)
@@ -195,6 +210,7 @@ def _build_plot_menu(window) -> None:
     disabled if CRYSTALClear is missing.
     """
     from crystalline.crystalio import available_plots, crystalclear_available
+    from crystalline.crystalio.vci import plottable as vci_plottable
 
     plot_menu = window.menuBar().addMenu("&Plot")
     window._plot_kinds = available_plots()
@@ -211,6 +227,28 @@ def _build_plot_menu(window) -> None:
         action.triggered.connect(lambda _checked=False, k=kind: window._open_plot(k))
         target.addAction(action)
         window._plot_actions[kind.key] = action
+    # Everything the vibrational spectra of the loaded output can offer —
+    # Raman polarisations and anharmonic levels included — behind one entry,
+    # because there are far too many curves for one action each.
+    plot_menu.addSeparator()
+    window._spectra_action = QAction("Vibrational spectra…", window)
+    window._spectra_action.triggered.connect(window._open_spectra)
+    plot_menu.addAction(window._spectra_action)
+    # Likewise for the VCI wavefunctions: a run holds one state per
+    # configuration, so which states and how much mixing to keep are choices
+    # only the user can make (see crystalline.crystalio.vci). Listed only when
+    # the installed CRYSTALClear can actually draw them.
+    if vci_plottable():
+        window._vci_action = QAction("VCI states…", window)
+        window._vci_action.triggered.connect(window._open_vci)
+        plot_menu.addAction(window._vci_action)
+    # Typography applies to every figure, not to one kind, so it sits on its own
+    # at the foot of the menu rather than inside any of the plot entries.
+    plot_menu.addSeparator()
+    window._font_action = QAction("Plot font…", window)
+    window._font_action.triggered.connect(window._open_plot_font)
+    plot_menu.addAction(window._font_action)
+
     if not crystalclear_available():
         plot_menu.setEnabled(False)
         plot_menu.setTitle("&Plot (CRYSTALClear not installed)")

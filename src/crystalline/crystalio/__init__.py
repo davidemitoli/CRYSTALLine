@@ -9,12 +9,20 @@ from crystalline.crystalio.loader import (
     LoadedFile,
     has_phonons,
     load,
+    load_adp,
     load_structure,
     load_phonons,
     output_properties,
     read_atoms,
     save_structure_gui,
     save_structure_cif,
+)
+from crystalline.crystalio.spectra import (
+    LINESHAPES,
+    SpectrumKind,
+    available_spectra,
+    load_spectra,
+    plot_spectra,
 )
 from crystalline.crystalio.plotting import (
     PlotKind,
@@ -23,11 +31,20 @@ from crystalline.crystalio.plotting import (
     crystalclear_available,
     output_availability,
 )
+from crystalline.crystalio.vci import (
+    REPRESENTATIONS,
+    VCIRun,
+    has_vci,
+    load_vci,
+    plot_vci,
+    vci_run,
+)
 
 __all__ = [
     "load",
     "LoadedFile",
     "has_phonons",
+    "load_adp",
     "load_structure",
     "load_phonons",
     "output_properties",
@@ -39,4 +56,15 @@ __all__ = [
     "available_plots",
     "crystalclear_available",
     "output_availability",
+    "LINESHAPES",
+    "SpectrumKind",
+    "available_spectra",
+    "load_spectra",
+    "plot_spectra",
+    "REPRESENTATIONS",
+    "VCIRun",
+    "has_vci",
+    "load_vci",
+    "plot_vci",
+    "vci_run",
 ]

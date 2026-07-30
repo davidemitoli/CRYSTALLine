@@ -14,7 +14,7 @@ import math
 from typing import Optional
 
 import numpy as np
-from PySide6.QtCore import QSize, QTimer, Signal
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from crystalline.core.mode_analysis import ModeCharacter, mode_character
 from crystalline.core.phonons import PhononMode, PhononModes
 from crystalline.viz.phonon_animator import PhononAnimator
 
@@ -46,6 +47,10 @@ _FILTERS = (
 # tighter). It keeps its scrollbar and stretches when there's room.
 _LIST_MIN_HEIGHT = 70
 
+# Two lines' worth, so the composition summary can wrap without the amplitude
+# and speed controls below it shifting as the selection changes.
+_CHARACTER_MIN_HEIGHT = 32
+
 # Animation timing. The timer stays at ~30 fps whatever the speed — speed
 # changes how far the phase moves per tick, so the motion stays smooth instead
 # of turning into a slideshow at low speed.
@@ -53,9 +58,28 @@ _FRAME_INTERVAL_MS = 33
 _FRAMES_PER_CYCLE = 60  # at speed 1.0: one full vibration in ~2 s
 _PHASE_STEP = 2.0 * math.pi / _FRAMES_PER_CYCLE
 
+# The largest share of the event loop the animation may take. A frame is a VTK
+# rebuild plus a synchronous render, and on a large cell that costs more than the
+# frame interval — at which point the timer is always overdue, fires back to
+# back, and leaves nothing for input: the whole window goes sluggish, camera
+# rotation stops tracking the mouse, and buttons take a visible moment to
+# respond. Holding the animation to this share guarantees the rest of the time
+# is there for Qt to deliver events.
+#
+# The animation degrades instead of the UI: a cell whose frames cost 60 ms
+# animates at ~8 fps rather than freezing everything else. A cheap frame costs
+# far less than the interval, so small structures still run at the full ~30 fps
+# and never notice this.
+_FRAME_DUTY = 0.5
+
 
 def _mode_label(index: int, mode: PhononMode) -> str:
-    """One list row: index, frequency and the tags that apply to the mode."""
+    """One list row: index, frequency and the tags that apply to the mode.
+
+    Composition deliberately stays out of the row — it belongs in the tooltip
+    and the summary line, where it has room to be read rather than squeezed
+    against the frequency.
+    """
     tags = []
     if mode.is_imaginary:
         tags.append("imag")
@@ -78,12 +102,17 @@ class PhononPanel(QWidget):
         self._modes: Optional[PhononModes] = None
         self._equilibrium: Optional[np.ndarray] = None
         self._rows: list[int] = []  # list row -> index into self._modes
+        self._numbers: Optional[np.ndarray] = None      # atomic numbers of the geometry
+        self._characters: list[ModeCharacter] = []      # per mode, parallel to self._modes
 
         self._phase = 0.0
         self._speed = 1.0
+        # Earliest time the next frame may be drawn, as a perf_counter reading.
+        # Set from how long the last frame actually took — see _on_timer.
+        self._next_frame_at = 0.0
         self._timer = QTimer(self)
         self._timer.setInterval(_FRAME_INTERVAL_MS)
-        self._timer.timeout.connect(self._tick)
+        self._timer.timeout.connect(self._on_timer)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -115,6 +144,20 @@ class PhononPanel(QWidget):
         self.mode_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.mode_list.currentRowChanged.connect(self._on_mode_changed)
         layout.addWidget(self.mode_list, 1)  # the only widget that takes the slack
+
+        # What the selected mode is made of. Wraps rather than widening the dock,
+        # and keeps its height when empty so the controls below don't jump about
+        # as the selection moves between modes with longer and shorter summaries.
+        self.character_label = QLabel("")
+        self.character_label.setWordWrap(True)
+        self.character_label.setStyleSheet("color: palette(mid);")
+        self.character_label.setMinimumHeight(_CHARACTER_MIN_HEIGHT)
+        self.character_label.setAlignment(Qt.AlignTop)
+        self.character_label.setToolTip(
+            "Share of the mode's kinetic energy carried by each element,\n"
+            "and how many atoms are effectively in motion."
+        )
+        layout.addWidget(self.character_label)
 
         # Amplitude and speed share a form so their labels and fields line up.
         controls = QFormLayout()
@@ -164,7 +207,16 @@ class PhononPanel(QWidget):
         return button
 
     # ── data ────────────────────────────────────────────────────────────
-    def set_modes(self, equilibrium: np.ndarray, modes: PhononModes) -> None:
+    def set_modes(
+        self, equilibrium: np.ndarray, modes: PhononModes, numbers=None
+    ) -> None:
+        """Load ``modes`` defined on the geometry at ``equilibrium``.
+
+        ``numbers`` are that geometry's atomic numbers; with them each mode is
+        labelled by the element carrying it and by how localised it is. Without
+        them the list falls back to bare frequencies — the panel stays usable if
+        a caller has only positions to hand.
+        """
         self._stop()
         # Drop the old rows before repopulating: a stale row would otherwise be
         # read back as a "keep this mode" hint for a different set of modes.
@@ -174,9 +226,27 @@ class PhononPanel(QWidget):
         self.mode_list.blockSignals(False)
         self._modes = modes
         self._equilibrium = np.asarray(equilibrium, dtype=float)
+        self._numbers = None if numbers is None else np.asarray(numbers, dtype=int)
+        self._characters = self._analyse(modes)
         self._set_filter_available(modes.has_activity)
         self._populate()
         self.setEnabled(len(modes) > 0)
+
+    def _analyse(self, modes: PhononModes) -> list:
+        """Composition of every mode, or an empty list if the geometry is unknown.
+
+        Cheap (a few flops per atom per mode) and done once per file, so the list
+        and the summary line can be built without re-deriving anything.
+        """
+        if self._numbers is None:
+            return []
+        return [mode_character(mode, self._numbers) for mode in modes]
+
+    def character(self, index: int) -> Optional[ModeCharacter]:
+        """Composition of mode ``index``, or ``None`` when it wasn't analysed."""
+        if 0 <= index < len(self._characters):
+            return self._characters[index]
+        return None
 
     def has_mode(self) -> bool:
         """Whether a mode is currently selected (so it can be animated/exported)."""
@@ -210,10 +280,14 @@ class PhononPanel(QWidget):
         back into the renderer would mismatch and is unnecessary.
         """
         self._timer.stop()
+        self._animator.clear_mode()  # takes the displacement arrows off the view
         self._modes = None
         self._equilibrium = None
+        self._numbers = None
+        self._characters = []
         self._rows = []
         self.mode_list.clear()
+        self.character_label.clear()
         self._set_filter_available(False)
         self.setEnabled(False)
 
@@ -245,12 +319,18 @@ class PhononPanel(QWidget):
             for i, mode in enumerate(self._modes):
                 if predicate is not None and not predicate(mode):
                     continue
+                character = self.character(i)
                 self._rows.append(i)
                 self.mode_list.addItem(_mode_label(i, mode))
+                if character is not None:
+                    self.mode_list.item(self.mode_list.count() - 1).setToolTip(
+                        character.summary(limit=6)
+                    )
         self.mode_list.blockSignals(False)
 
         if not self._rows:
             self._stop()  # nothing left to animate under this filter
+            self.character_label.clear()
             return
         row = self._rows.index(keep) if keep in self._rows else 0
         # Select quietly, then drive the change by hand: setCurrentRow emits
@@ -269,7 +349,30 @@ class PhononPanel(QWidget):
         self._animator.set_mode(self._equilibrium, self._modes[index])
         self._phase = 0.0
         self._animator.set_frame(0.0)
+        character = self.character(index)
+        self.character_label.setText("" if character is None else character.summary(limit=4))
         self.mode_selected.emit(index)
+
+    def select_mode(self, index: int) -> bool:
+        """Select mode ``index`` in the list, returning whether it could be shown.
+
+        The list may be filtered, so the requested mode isn't always on it —
+        clicking an IR peak while the list shows only Raman-active modes, say.
+        Rather than silently doing nothing, the filter is dropped back to
+        "All modes" so the mode the user asked for is the one they get.
+        """
+        if self._modes is None or not 0 <= index < len(self._modes):
+            return False
+        if index not in self._rows:
+            self.filter_box.setCurrentIndex(0)  # triggers _populate under "All modes"
+        if index not in self._rows:
+            return False
+        self.mode_list.setCurrentRow(self._rows.index(index))
+        return True
+
+    def frequencies(self) -> Optional[np.ndarray]:
+        """The loaded modes' frequencies in cm⁻¹, or ``None`` if none are loaded."""
+        return None if self._modes is None else self._modes.frequencies
 
     def _on_amplitude(self, value: float) -> None:
         self._animator.amplitude = value
@@ -305,6 +408,7 @@ class PhononPanel(QWidget):
 
     def _play(self) -> None:
         if self._modes is not None and self.has_mode():
+            self._next_frame_at = 0.0  # draw the first frame straight away
             self._timer.start()
 
     def _stop(self) -> None:
@@ -314,7 +418,29 @@ class PhononPanel(QWidget):
         self._phase = 0.0
         self._animator.reset()
 
+    def _on_timer(self) -> None:
+        """Draw a frame, unless doing so would crowd the UI off the event loop.
+
+        The timer keeps its steady ~30 fps beat; this decides whether each beat
+        becomes a frame. After a frame costing ``t`` the next one is held off for
+        ``t * (1/_FRAME_DUTY - 1)``, so the animation never occupies more than
+        :data:`_FRAME_DUTY` of the loop and input always has room. Skipped beats
+        return in microseconds, which is the point — that is the idle time.
+
+        Kept separate from :meth:`_tick` so the pacing and the frame itself can be
+        reasoned about (and tested) independently.
+        """
+        from time import perf_counter
+
+        if perf_counter() < self._next_frame_at:
+            return  # yield this beat to the event loop
+        started = perf_counter()
+        self._tick()
+        cost = perf_counter() - started
+        self._next_frame_at = perf_counter() + cost * (1.0 / _FRAME_DUTY - 1.0)
+
     def _tick(self) -> None:
+        """Draw one frame and advance the phase (no pacing — see :meth:`_on_timer`)."""
         self._animator.set_frame(self._phase)
         self._phase = (self._phase + _PHASE_STEP * self._speed) % (2.0 * math.pi)
 

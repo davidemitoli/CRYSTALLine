@@ -1,5 +1,7 @@
 """Tests for StructureRenderer's cell wireframe (off-screen PyVista)."""
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -7,6 +9,7 @@ pytest.importorskip("pyvista")
 pytest.importorskip("ase")
 
 import pyvista as pv  # noqa: E402
+from ase import Atoms  # noqa: E402
 from ase.build import bulk  # noqa: E402
 
 from crystalline.core.structure import Structure  # noqa: E402
@@ -65,20 +68,68 @@ def test_slab_cell_box_is_flat_not_500_angstroms():
     assert extent[0] > 1.0 and extent[1] > 1.0  # but spans the periodic plane
 
 
-def test_lattice_vectors_drawn_for_periodic_only():
+def test_the_abc_gizmo_lives_in_screen_space_not_in_the_scene():
+    """It is pinned to a viewport corner, so it stays put whatever the camera
+    does. As a scene actor it moved with every view change — the three axis
+    alignments each put it somewhere different, which is what a gizmo must not
+    do. Being in screen space, it contributes no actors to the renderer."""
+    renderer = StructureRenderer(pv.Plotter(off_screen=True))
+    periodic = Structure.from_ase(bulk("NaCl", "rocksalt", a=5.64))
+
+    renderer.set_structure(periodic)
+
+    assert renderer._orientation_widget is not None
+    # an arrow and a label per periodic direction, plus the invisible prop that
+    # widens the bounds so the labels aren't clipped at the viewport edge
+    assert renderer._lattice_marker().GetParts().GetNumberOfItems() == 3 * 2 + 1
+
+
+def test_the_gizmo_shows_one_arrow_per_periodic_direction():
+    """A slab must not sprout a c arrow along CRYSTAL's 500 Å vacuum vector."""
+    from ase.build import fcc111
+
+    slab = fcc111("Pt", size=(2, 2, 2), vacuum=0.0)
+    cell = np.asarray(slab.get_cell(), dtype=float)
+    cell[2] = [0.0, 0.0, 500.0]
+    slab.set_cell(cell)
+    slab.set_pbc((True, True, False))
     renderer = StructureRenderer(pv.Plotter(off_screen=True))
 
-    periodic = Structure.from_ase(bulk("NaCl", "rocksalt", a=5.64))
-    renderer.set_structure(periodic)
-    # 3 arrow actors + 1 label actor for the a/b/c gizmo (plus atoms/bonds/cell)
-    assert _count_actors(renderer) >= 3
+    renderer.set_structure(Structure.from_ase(slab))
 
+    assert renderer._lattice_marker().GetParts().GetNumberOfItems() == 2 * 2 + 1  # a and b only
+
+
+def test_the_gizmo_labels_are_screen_aligned_captions():
+    """3D text turns edge-on and vanishes exactly when its axis points at the
+    viewer — which is the case in each of the a/b/c alignment views. Captions are
+    drawn in the image plane, so they stay upright and legible from every angle."""
+    import vtk
+
+    renderer = StructureRenderer(pv.Plotter(off_screen=True))
+    renderer.set_structure(Structure.from_ase(bulk("NaCl", "rocksalt", a=5.64)))
+
+    parts = renderer._lattice_marker().GetParts()
+    parts.InitTraversal()
+    captions = [
+        part for part in (parts.GetNextProp() for _ in range(parts.GetNumberOfItems()))
+        if isinstance(part, vtk.vtkCaptionActor2D)
+    ]
+
+    assert [c.GetCaption() for c in captions] == ["a", "b", "c"]
+    # no border and no leader line: just the letter at the arrow tip
+    assert all(not c.GetBorder() and not c.GetLeader() for c in captions)
+
+
+def test_a_non_periodic_structure_has_no_gizmo():
+    renderer = StructureRenderer(pv.Plotter(off_screen=True))
     mol = Structure.empty()
     mol.add_atom("O", [0.0, 0.0, 0.0])
     mol.add_atom("H", [0.96, 0.0, 0.0])
-    before = _count_actors(renderer)
-    renderer.set_structure(mol)  # non-periodic: no lattice arrows, no crash
-    assert _count_actors(renderer) < before
+
+    renderer.set_structure(mol)  # no lattice to point at, no crash
+
+    assert renderer._lattice_marker() is None
 
 
 def _count_actors(renderer):
@@ -552,3 +603,550 @@ def test_periodic_images_span_a_supercell_via_reference_cell():
     images = renderer.periodic_image_indices(0)
     assert len(images) == 7  # 2×2×2 tiles → 8 copies of the site, minus itself
     assert all(supercell.numbers[i] == supercell.numbers[0] for i in images)
+
+
+# ── phonon displacement arrows ────────────────────────────────────────────
+def _two_atoms() -> Structure:
+    s = Structure.empty()
+    s.set_cell(np.eye(3) * 8, periodic=False)
+    s.add_atom("C", [4.0, 4.0, 4.0])
+    s.add_atom("O", [5.2, 4.0, 4.0])
+    return s
+
+
+def _arrow_extent(renderer):
+    """Longest side of the arrow actor's bounding box, in Angstrom."""
+    bounds = np.array(renderer._arrow_actor.GetBounds()).reshape(3, 2)
+    return float((bounds[:, 1] - bounds[:, 0]).max())
+
+
+_ARROWS_ON = RenderSettings(show_mode_arrows=True, show_polyhedra=False)
+
+
+def _arrow_renderer(settings: RenderSettings = _ARROWS_ON, structure=None):
+    renderer = StructureRenderer(pv.Plotter(off_screen=True), settings)
+    renderer.set_structure(structure if structure is not None else _two_atoms())
+    return renderer
+
+
+def test_arrows_are_off_until_asked_for():
+    """The animation is the primary view; arrows on top of it are opt-in."""
+    assert RenderSettings().show_mode_arrows is False
+
+    renderer = StructureRenderer(pv.Plotter(off_screen=True))  # stock settings
+    renderer.set_structure(_two_atoms())
+    renderer.set_mode_vectors(np.array([[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]]))
+
+    assert renderer._arrow_actor is None
+
+
+def test_mode_vectors_are_drawn_and_cleared():
+    renderer = _arrow_renderer()
+    assert renderer._arrow_actor is None  # nothing to show until a mode is chosen
+
+    renderer.set_mode_vectors(np.array([[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]]))
+    assert renderer._arrow_actor is not None
+
+    renderer.set_mode_vectors(None)
+    assert renderer._arrow_actor is None
+
+
+def test_every_arrow_is_drawn_at_the_same_length():
+    """Arrows mark direction, not distance. Two atoms 10 Å apart moving apart by
+    very different amounts must still get identically-sized arrows — so the span
+    they cover is the separation plus two whole arrows, not one and a fraction."""
+    structure = Structure.empty()
+    structure.set_cell(np.eye(3) * 40, periodic=False)
+    structure.add_atom("C", [0.0, 0.0, 0.0])
+    structure.add_atom("C", [0.0, 0.0, 10.0])
+    renderer = _arrow_renderer(
+        RenderSettings(show_mode_arrows=True, show_polyhedra=False, mode_arrow_scale=2.0),
+        structure,
+    )
+
+    # the far atom barely moves; its arrow must be as long as the near one's
+    renderer.set_mode_vectors(np.array([[0.0, 0.0, -1.0], [0.0, 0.0, 0.2]]))
+
+    assert _arrow_extent(renderer) == pytest.approx(10.0 + 2 * 2.0, abs=0.05)
+
+
+def test_arrow_length_ignores_the_eigenvector_norm():
+    """Eigenvectors are normalised over the whole cell, so their absolute size
+    means nothing on screen: the setting alone fixes the drawn length."""
+    renderer = _arrow_renderer(
+        RenderSettings(show_mode_arrows=True, show_polyhedra=False, mode_arrow_scale=2.0)
+    )
+
+    renderer.set_mode_vectors(np.array([[0.0, 0.01, 0.0], [0.0, 0.0, 0.0]]))
+    tiny = _arrow_extent(renderer)
+    renderer.set_mode_vectors(np.array([[0.0, 100.0, 0.0], [0.0, 0.0, 0.0]]))
+    huge = _arrow_extent(renderer)
+
+    assert tiny == pytest.approx(huge, abs=1e-6)  # same drawn size either way
+    assert huge == pytest.approx(2.0, abs=0.05)   # and it is the requested scale
+
+
+def test_atoms_barely_involved_in_the_mode_get_no_arrow():
+    """With every arrow the same length, an atom that hardly moves would
+    otherwise be flagged as strongly as the one carrying the mode."""
+    renderer = _arrow_renderer(
+        RenderSettings(show_mode_arrows=True, show_polyhedra=False, mode_arrow_scale=2.0)
+    )
+
+    # second atom at 0.1% of the first: below the cut-off, so one arrow only
+    renderer.set_mode_vectors(np.array([[0.0, 0.0, 1.0], [0.0, 0.0, 0.001]]))
+
+    assert _arrow_extent(renderer) == pytest.approx(2.0, abs=0.05)
+
+
+def test_a_mismatched_or_null_mode_draws_no_arrows():
+    """The shown structure can be swapped (supercell, cell view) under a
+    selected mode; and an all-zero eigenvector has no direction to draw."""
+    renderer = _arrow_renderer()
+
+    renderer.set_mode_vectors(np.ones((5, 3)))  # five vectors, two atoms
+    assert renderer._arrow_actor is None
+
+    renderer.set_mode_vectors(np.zeros((2, 3)))
+    assert renderer._arrow_actor is None
+
+
+def test_arrows_can_be_switched_off_in_the_display_settings():
+    renderer = _arrow_renderer()
+    renderer.set_mode_vectors(np.array([[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]]))
+    assert renderer._arrow_actor is not None
+
+    renderer.set_settings(RenderSettings(show_mode_arrows=False))
+    assert renderer._arrow_actor is None
+
+    renderer.set_settings(RenderSettings(show_mode_arrows=True))
+    assert renderer._arrow_actor is not None  # and come back with the setting
+
+
+def test_arrows_travel_with_the_atoms_during_an_animation():
+    structure = _two_atoms()
+    renderer = _arrow_renderer(structure=structure)
+    renderer.set_mode_vectors(np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 0.0]]))
+    before = np.array(renderer._arrow_actor.GetBounds()).reshape(3, 2)[2]  # z range
+
+    renderer.update_positions(structure.positions + np.array([0.0, 0.0, 3.0]))
+    after = np.array(renderer._arrow_actor.GetBounds()).reshape(3, 2)[2]
+
+    assert after == pytest.approx(before + 3.0, abs=1e-6)
+
+
+# ── thermal ellipsoids (ADP) ──────────────────────────────────────────────
+_ADP_ON = RenderSettings(show_adp_ellipsoids=True, show_polyhedra=False)
+# A realistic room-temperature ADP: ~0.1 Å r.m.s. displacement.
+_TYPICAL_ADP = np.diag([0.012, 0.008, 0.020])
+
+
+def _adp_renderer(settings: RenderSettings = _ADP_ON, structure=None):
+    renderer = StructureRenderer(pv.Plotter(off_screen=True), settings)
+    renderer.set_structure(structure if structure is not None else _two_atoms())
+    return renderer
+
+
+def test_ellipsoids_replace_the_atom_spheres():
+    """The ellipsoid *is* the atom, as in ORTEP. Keeping the covalent-radius
+    sphere as well would bury it — a 50% ellipsoid is a couple of tenths of an
+    Angstrom across, the drawn atom several times that."""
+    renderer = _adp_renderer()
+    assert renderer._atom_actor is not None and renderer._adp_actor is None
+
+    renderer.set_adp_tensors(np.tile(_TYPICAL_ADP, (2, 1, 1)))
+
+    assert renderer._adp_actor is not None
+    assert renderer._atom_actor is None  # every atom became an ellipsoid
+
+
+def test_an_ellipsoid_is_picked_as_its_atom():
+    """Picking must keep working when the sphere it used to hit is gone."""
+    renderer = _adp_renderer()
+    renderer.set_adp_tensors(np.tile(_TYPICAL_ADP, (2, 1, 1)))
+
+    assert renderer.pick_atom_index(renderer._adp_actor, [5.2, 4.0, 4.0]) == 1
+    assert renderer.pick_atom_index(renderer._adp_actor, [4.0, 4.0, 4.0]) == 0
+    assert renderer.pick_atom_index(None, [4.0, 4.0, 4.0]) is None
+
+
+def test_the_drawn_ellipsoid_has_the_tensor_s_size_and_orientation():
+    """A tensor stretched along z must draw an ellipsoid stretched along z, at
+    the semi-axis length the probability asks for."""
+    structure = Structure.empty()
+    structure.set_cell(np.eye(3) * 30, periodic=False)
+    structure.add_atom("C", [0.0, 0.0, 0.0])
+    probability = 0.5  # pinned, not the app default, so the arithmetic is explicit
+    renderer = _adp_renderer(
+        RenderSettings(show_adp_ellipsoids=True, show_polyhedra=False,
+                       adp_probability=probability),
+        structure,
+    )
+
+    renderer.set_adp_tensors(np.array([np.diag([0.01, 0.01, 0.04])]))
+
+    from crystalline.core.adp import probability_scale
+
+    extent = np.array(renderer._adp_actor.GetBounds()).reshape(3, 2)
+    span = extent[:, 1] - extent[:, 0]
+    expected = 2 * probability_scale(probability) * np.sqrt([0.01, 0.01, 0.04])
+    assert np.allclose(span, expected, rtol=0.02)
+
+
+def test_a_higher_probability_draws_a_bigger_ellipsoid():
+    renderer = _adp_renderer(
+        RenderSettings(show_adp_ellipsoids=True, show_polyhedra=False, adp_probability=0.5)
+    )
+    renderer.set_adp_tensors(np.tile(_TYPICAL_ADP, (2, 1, 1)))
+    at_50 = np.array(renderer._adp_actor.GetBounds()).reshape(3, 2)
+
+    renderer.set_settings(RenderSettings(show_adp_ellipsoids=True, show_polyhedra=False,
+                                         adp_probability=0.99))
+    at_99 = np.array(renderer._adp_actor.GetBounds()).reshape(3, 2)
+
+    span_50 = (at_50[:, 1] - at_50[:, 0]).max()
+    span_99 = (at_99[:, 1] - at_99[:, 0]).max()
+    assert span_99 > span_50
+
+
+def test_tensors_that_do_not_match_the_geometry_are_kept_but_not_drawn():
+    """Switching cell view or supercell must not silently discard the file's
+    ADPs, but must not draw them against the wrong atoms either."""
+    renderer = _adp_renderer()
+
+    renderer.set_adp_tensors(np.tile(_TYPICAL_ADP, (7, 1, 1)))  # seven tensors, two atoms
+
+    assert renderer._adp_actor is None
+    assert renderer._atom_actor is not None      # atoms stay drawn as spheres
+    assert renderer._adp_tensors is not None     # ...and the tensors are still held
+
+
+def test_an_atom_with_a_vanishing_tensor_keeps_its_sphere():
+    """A null or clamped-flat tensor would render as an invisible speck; that
+    atom is better drawn the ordinary way than not at all."""
+    renderer = _adp_renderer()
+
+    renderer.set_adp_tensors(np.array([_TYPICAL_ADP, np.zeros((3, 3))]))
+
+    assert list(renderer._ellipsoid_atoms()) == [True, False]
+    assert renderer._adp_actor is not None   # the first atom
+    assert renderer._atom_actor is not None  # the second
+
+
+def test_switching_ellipsoids_off_brings_the_spheres_back():
+    renderer = _adp_renderer()
+    renderer.set_adp_tensors(np.tile(_TYPICAL_ADP, (2, 1, 1)))
+    assert renderer._atom_actor is None
+
+    renderer.set_settings(RenderSettings(show_adp_ellipsoids=False))
+    assert renderer._adp_actor is None
+    assert renderer._atom_actor is not None
+
+    renderer.set_adp_tensors(None)
+    assert renderer._adp_actor is None
+
+
+def test_ellipsoids_travel_with_the_atoms_during_an_animation():
+    """A vibration moves the atoms; their displacement tensors don't change. So
+    each ellipsoid must slide onto its own atom keeping its shape — not stay
+    behind at the equilibrium site, and not be rebuilt every frame."""
+    structure = _two_atoms()
+    renderer = _adp_renderer(structure=structure)
+    renderer.set_adp_tensors(np.array([_TYPICAL_ADP, _TYPICAL_ADP * 2]))
+    equilibrium = structure.positions.copy()
+    before = np.array(renderer._adp_mesh_obj.points)
+    index, _offset = renderer._adp_follow
+
+    # a per-atom displacement, as an eigenvector gives: the two atoms move
+    # differently, so a rigid shift of the whole mesh would not do
+    shift = np.array([[0.0, 0.0, 0.7], [0.3, 0.0, -0.2]])
+    renderer.update_positions(equilibrium + shift)
+
+    after = np.array(renderer._adp_mesh_obj.points)
+    for atom in np.unique(index):
+        vertices = index == atom
+        assert np.allclose(after[vertices] - before[vertices], shift[atom])
+        # shape and orientation untouched: only the centre moved
+        assert np.allclose(
+            after[vertices] - after[vertices].mean(axis=0),
+            before[vertices] - before[vertices].mean(axis=0),
+        )
+
+
+def test_ellipsoids_return_to_rest_when_the_animation_stops():
+    structure = _two_atoms()
+    renderer = _adp_renderer(structure=structure)
+    renderer.set_adp_tensors(np.tile(_TYPICAL_ADP, (2, 1, 1)))
+    equilibrium = structure.positions.copy()
+    at_rest = np.array(renderer._adp_mesh_obj.points)
+
+    renderer.update_positions(equilibrium + np.array([[0.0, 0.0, 0.5], [0.0, 0.0, -0.5]]))
+    renderer.update_positions(equilibrium)
+
+    assert np.allclose(np.array(renderer._adp_mesh_obj.points), at_rest)
+
+
+def test_atoms_still_drawn_as_spheres_animate_alongside_their_ellipsoid_neighbours():
+    """A mixed cell — one atom with a usable tensor, one without — must animate
+    as a whole, the sphere and the ellipsoid moving together."""
+    structure = _two_atoms()
+    renderer = _adp_renderer(structure=structure)
+    renderer.set_adp_tensors(np.array([_TYPICAL_ADP, np.zeros((3, 3))]))
+    assert renderer._adp_actor is not None and renderer._atom_actor is not None
+
+    sphere_before = np.array(renderer._atom_actor.GetBounds()).reshape(3, 2)[2]
+    ellipsoid_before = np.array(renderer._adp_actor.GetBounds()).reshape(3, 2)[2]
+
+    renderer.update_positions(structure.positions + np.array([0.0, 0.0, 0.6]))
+
+    assert np.allclose(
+        np.array(renderer._atom_actor.GetBounds()).reshape(3, 2)[2], sphere_before + 0.6
+    )
+    assert np.allclose(
+        np.array(renderer._adp_actor.GetBounds()).reshape(3, 2)[2], ellipsoid_before + 0.6
+    )
+
+
+def test_an_ellipsoid_can_be_grabbed_and_dragged_like_an_atom():
+    """With ADPs shown the ellipsoid *is* the atom: it is what the user clicks,
+    so it has to be what follows the cursor. Its sphere isn't even drawn."""
+    structure = _two_atoms()
+    renderer = _adp_renderer(structure=structure)
+    renderer.set_adp_tensors(np.tile(_TYPICAL_ADP, (2, 1, 1)))
+    assert renderer._atom_actor is None  # nothing but ellipsoids to grab
+
+    # a click on the ellipsoid resolves to the atom underneath it
+    assert renderer.pick_atom_index(renderer._adp_actor, structure.positions[1]) == 1
+
+    index, _offset = renderer._adp_follow
+    before = np.array(renderer._adp_mesh_obj.points)
+    renderer.preview_atom_position(1, structure.positions[1] + np.array([0.0, 0.0, 2.0]))
+    after = np.array(renderer._adp_mesh_obj.points)
+
+    assert np.allclose(after[index == 1] - before[index == 1], [0.0, 0.0, 2.0])
+    assert np.allclose(after[index == 0], before[index == 0])  # the other atom stays put
+
+
+def test_dragging_carries_the_whole_move_group_s_ellipsoids():
+    """Periodic images move with the atom they copy, so their ellipsoids must too
+    — otherwise the boundary images tear away from their atoms."""
+    from crystalline.core.cells import complete_boundary
+
+    nacl = Structure.from_ase(bulk("NaCl", "rocksalt", a=5.64, cubic=True))
+    packed, _modes = complete_boundary(nacl)
+    renderer = _adp_renderer(structure=packed)
+    renderer.set_adp_tensors(np.tile(_TYPICAL_ADP, (len(packed), 1, 1)))
+    group = renderer.active_move_group(0)
+    assert group, "this cell should have periodic images to move as a group"
+
+    index, _offset = renderer._adp_follow
+    before = np.array(renderer._adp_mesh_obj.points)
+    renderer.preview_atom_position(0, packed.positions[0] + np.array([0.0, 0.0, 1.5]))
+    after = np.array(renderer._adp_mesh_obj.points)
+
+    for atom in (0, *group):
+        assert np.allclose(after[index == atom] - before[index == atom], [0.0, 0.0, 1.5])
+    untouched = [a for a in np.unique(index) if a not in (0, *group)]
+    for atom in untouched:
+        assert np.allclose(after[index == atom], before[index == atom])
+
+
+def test_a_dragged_ellipsoid_keeps_its_own_shape():
+    """Moving an atom doesn't change its displacement tensor, and two atoms with
+    different tensors must not end up sharing one."""
+    structure = _two_atoms()
+    renderer = _adp_renderer(structure=structure)
+    renderer.set_adp_tensors(
+        np.array([np.diag([0.02, 0.005, 0.005]), np.diag([0.005, 0.02, 0.005])])
+    )
+
+    def shapes():
+        index, _offset = renderer._adp_follow
+        points = np.array(renderer._adp_mesh_obj.points)
+        return [np.ptp(points[index == a], axis=0) for a in (0, 1)]
+
+    before = shapes()
+    renderer.preview_atom_position(1, structure.positions[1] + np.array([0.0, 0.0, 3.0]))
+    after = shapes()
+
+    assert all(np.allclose(b, a) for b, a in zip(before, after))
+    assert not np.allclose(after[0], after[1])  # still distinguishable from each other
+
+
+def test_polyhedra_stand_down_while_ellipsoids_are_shown():
+    """A translucent coordination solid swallows a 0.1 Å ellipsoid whole, so the
+    two are never drawn together — but the setting is untouched, and the
+    polyhedra come back the moment the ellipsoids go."""
+    nacl = Structure.from_ase(bulk("NaCl", "rocksalt", a=5.64, cubic=True))
+    renderer = StructureRenderer(
+        pv.Plotter(off_screen=True),
+        RenderSettings(show_polyhedra=True, show_adp_ellipsoids=True),
+    )
+    renderer.set_structure(nacl)
+    assert renderer._polyhedra_actor is not None  # no ADPs yet, so polyhedra draw
+
+    renderer.set_adp_tensors(np.tile(_TYPICAL_ADP, (len(nacl), 1, 1)))
+    assert renderer._adp_actor is not None
+    assert renderer._polyhedra_actor is None
+    assert renderer._polyhedra_edge_actor is None  # the outline goes with them
+    assert renderer.settings.show_polyhedra is True  # the user's setting is intact
+
+    renderer.set_adp_tensors(None)
+    assert renderer._polyhedra_actor is not None
+
+
+def test_hiding_the_ellipsoids_brings_the_polyhedra_back():
+    nacl = Structure.from_ase(bulk("NaCl", "rocksalt", a=5.64, cubic=True))
+    renderer = StructureRenderer(
+        pv.Plotter(off_screen=True),
+        RenderSettings(show_polyhedra=True, show_adp_ellipsoids=True),
+    )
+    renderer.set_structure(nacl)
+    renderer.set_adp_tensors(np.tile(_TYPICAL_ADP, (len(nacl), 1, 1)))
+    assert renderer._polyhedra_actor is None
+
+    renderer.set_settings(RenderSettings(show_polyhedra=True, show_adp_ellipsoids=False))
+
+    assert renderer._adp_actor is None
+    assert renderer._polyhedra_actor is not None
+
+
+def test_appearance_only_settings_skip_the_rebuild():
+    """The Display dock streams settings on every slider tick, and a rebuild on a
+    large cell is not cheap. Opacities, the background and the projection change
+    nothing any mesh depends on, so they are pushed onto the actors in place."""
+    nacl = Structure.from_ase(bulk("NaCl", "rocksalt", a=5.64, cubic=True))
+    renderer = StructureRenderer(pv.Plotter(off_screen=True))
+    renderer.set_structure(nacl)
+
+    rebuilds = []
+    renderer._rebuild = lambda: rebuilds.append(1)
+
+    base = renderer.settings
+    for changed in (
+        dict(atom_opacity=0.4),
+        dict(polyhedra_opacity=0.9),
+        dict(background_color="#202020"),
+        dict(parallel_projection=not base.parallel_projection),
+    ):
+        renderer.set_settings(replace(base, **changed))
+        assert rebuilds == [], changed
+
+    # ...and the opacity really reached the actor, rather than being dropped.
+    renderer.set_settings(replace(base, atom_opacity=0.25))
+    assert renderer._atom_actor.GetProperty().GetOpacity() == pytest.approx(0.25)
+
+    # Anything geometric still rebuilds, including a re-push of identical
+    # settings (which is how staged ADP tensors get drawn).
+    for changed in (dict(atom_scale=0.7), dict(show_bonds=False),
+                    dict(polyhedra_min_vertices=6), {}):
+        rebuilds.clear()
+        renderer.set_settings(replace(base, **changed))
+        assert rebuilds == [1], changed
+
+
+def test_dragging_a_large_cell_does_not_rescan_hydrogen_bonds():
+    """The scan is by far the costliest part of drawing hydrogen bonds (~140 ms on
+    a 2400-atom hydrated cell), so the live paths cap it at _LIVE_HBOND_MAX_ATOMS.
+    The drag path used to skip that cap and pay it on every mouse-move event."""
+    from crystalline.core import bonds
+    from crystalline.viz.renderer import _LIVE_HBOND_MAX_ATOMS
+
+    def water_box(n_waters):
+        positions, symbols = [], []
+        side = float(n_waters) ** (1 / 3) * 4.0
+        rng = np.random.default_rng(0)
+        for _ in range(n_waters):
+            o = rng.random(3) * side
+            positions += [o, o + [0.96, 0, 0], o + [-0.24, 0.93, 0]]
+            symbols += ["O", "H", "H"]
+        return Structure.from_ase(
+            Atoms(symbols, positions=positions, cell=np.eye(3) * side * 1.3, pbc=True)
+        )
+
+    scans = []
+    real_pairs = bonds.hydrogen_bond_pairs
+    bonds.hydrogen_bond_pairs = lambda *a, **k: (scans.append(1), real_pairs(*a, **k))[1]
+    try:
+        for n_waters, expect_scan in ((20, True), (_LIVE_HBOND_MAX_ATOMS, False)):
+            structure = water_box(n_waters)
+            renderer = StructureRenderer(pv.Plotter(off_screen=True))
+            renderer.set_structure(structure)
+            target = renderer.atom_position(0)
+            scans.clear()
+            renderer.preview_atom_position(0, target + 0.05)
+            assert bool(scans) is expect_scan, (n_waters, scans)
+    finally:
+        bonds.hydrogen_bond_pairs = real_pairs
+
+
+def test_the_ellipsoid_mask_is_not_recomputed_for_every_frame():
+    """Which atoms get an ellipsoid depends on the tensors and the probability,
+    never on where the atoms are — but it is consulted on every re-glyph, i.e.
+    once per animation frame and per drag mouse-move."""
+    nacl = Structure.from_ase(bulk("NaCl", "rocksalt", a=5.64, cubic=True))
+    renderer = StructureRenderer(
+        pv.Plotter(off_screen=True),
+        RenderSettings(show_adp_ellipsoids=True, show_polyhedra=False),
+    )
+    renderer.set_structure(nacl)
+    renderer.set_adp_tensors(np.tile(_TYPICAL_ADP, (len(nacl), 1, 1)))
+
+    computed = []
+    real_compute = renderer._compute_ellipsoid_atoms
+    renderer._compute_ellipsoid_atoms = lambda: (computed.append(1), real_compute())[1]
+
+    positions = np.asarray(nacl.positions, dtype=float)
+    for step in range(3):
+        renderer.update_positions(positions + 0.01 * step)
+    assert computed == []  # served from the cache throughout
+
+    # New tensors decide anew, so the cache must not survive them.
+    renderer.set_adp_tensors(np.tile(_TYPICAL_ADP * 4.0, (len(nacl), 1, 1)))
+    renderer.update_positions(positions)
+    assert computed == [1]
+
+
+def test_moving_atoms_reuses_the_atom_actor_instead_of_rebuilding_it():
+    """A live position change keeps every sphere's size, colour and triangulation
+    and moves only its centre, so it writes the mesh's points rather than
+    dropping the actor and re-glyphing. That teardown was the largest single
+    cost of an animation frame (~10 ms even at 64 atoms, nearly all of it
+    pipeline overhead), and it is what made the whole UI sluggish while a phonon
+    animation ran."""
+    nacl = Structure.from_ase(bulk("NaCl", "rocksalt", a=5.64, cubic=True))
+    renderer = StructureRenderer(pv.Plotter(off_screen=True))
+    renderer.set_structure(nacl)
+
+    actor = renderer._atom_actor
+    mesh = renderer._atom_mesh_obj
+    assert actor is not None and mesh is not None
+    points_before = np.array(mesh.points)
+    colours_before = np.array(mesh["rgb"])
+
+    shift = np.array([0.0, 0.0, 0.7])
+    renderer.update_positions(np.asarray(nacl.positions, dtype=float) + shift)
+
+    assert renderer._atom_actor is actor          # same actor, not a replacement
+    assert renderer._atom_mesh_obj is mesh        # and the same mesh
+    assert np.allclose(mesh.points, points_before + shift)  # every vertex followed
+    assert np.array_equal(mesh["rgb"], colours_before)      # colours untouched
+
+
+def test_a_changed_atom_count_still_rebuilds_the_glyph():
+    """The follow map is only valid for the atoms it was built from; anything
+    that invalidates it has to fall back to a real rebuild rather than index
+    out of range."""
+    structure = Structure.empty()
+    for k in range(4):
+        structure.add_atom("C", [k * 1.6, 0.0, 0.0])
+    renderer = StructureRenderer(pv.Plotter(off_screen=True))
+    renderer.set_structure(structure)
+    n_before = renderer._atom_mesh_obj.n_points
+
+    structure.add_atom("O", [0.0, 2.0, 0.0])  # -> listener -> refresh -> rebuild
+    renderer.refresh()
+
+    assert renderer._atom_mesh_obj.n_points > n_before
+    assert renderer.atom_count == 5
+    renderer.update_positions(np.asarray(structure.positions, dtype=float))  # must not raise

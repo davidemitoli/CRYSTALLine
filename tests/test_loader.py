@@ -55,6 +55,73 @@ def test_load_of_a_cif_carries_no_phonon_modes(tmp_path):
     assert not result.has_phonons
 
 
+class _StubGeometry:
+    """Stands in for CRYSTALClear's ``Crystal_output`` geometry reader.
+
+    ``get_geometry`` returns a pymatgen ``Structure`` — always 3D-periodic,
+    exactly as CRYSTALClear's does — alongside the dimensionality CRYSTAL
+    printed for the run.
+    """
+
+    def __init__(self, dimensionality, raises=False):
+        self._dimensionality = dimensionality
+        self._raises = raises
+
+    def get_dimensionality(self):
+        if self._raises:
+            raise Exception("Invalid file. Dimension information not found.")
+        return self._dimensionality
+
+    def get_geometry(self, initial=False):
+        from pymatgen.core.structure import Structure as PmgStructure
+
+        # A slab as CRYSTAL writes one: a real a/b plane and a formal 500 Å c.
+        return PmgStructure(
+            [[5.4, 0.0, 0.0], [0.0, 5.6, 0.0], [0.0, 0.0, 500.0]],
+            ["Ca", "O"],
+            [[0.0, 0.0, 0.0], [0.5, 0.5, 0.002]],
+        )
+
+
+@pytest.mark.parametrize(
+    "dimensionality, expected",
+    [(3, [True, True, True]), (2, [True, True, False]), (1, [True, False, False])],
+)
+def test_out_geometry_carries_crystals_dimensionality(dimensionality, expected):
+    """A 2D slab must not come back periodic along c.
+
+    CRYSTAL fills an aperiodic direction with a formal 500 Å vacuum vector, and
+    pymatgen's Structure flags every direction periodic regardless. Anything
+    trusting that then treats the vacuum as a lattice direction — the cell is
+    drawn 500 Å tall, and CrystalNN's Voronoi tessellation hangs on it.
+    """
+    from crystalline.crystalio.loader import _out_geometry_to_ase
+
+    atoms = _out_geometry_to_ase(_StubGeometry(dimensionality), initial=False)
+
+    assert list(atoms.get_pbc()) == expected
+
+
+def test_out_geometry_stays_periodic_when_dimensionality_is_unreadable():
+    from crystalline.crystalio.loader import _out_geometry_to_ase
+
+    atoms = _out_geometry_to_ase(_StubGeometry(None, raises=True), initial=False)
+
+    assert list(atoms.get_pbc()) == [True, True, True]
+
+
+def test_slab_connectivity_falls_back_instead_of_hanging():
+    """The guard that keeps CrystalNN off a vacuum axis keys on ``pbc``, so it
+    only works if the loader set it — this pins the two together."""
+    from crystalline.core.bonds import connectivity
+    from crystalline.core.structure import Structure
+    from crystalline.crystalio.loader import _out_geometry_to_ase
+
+    slab = Structure.from_ase(_out_geometry_to_ase(_StubGeometry(2), initial=False))
+
+    assert connectivity(slab) is None  # -> caller uses the bounded distance search
+
+
 def test_per_mode_normalises_crystalclear_activity_arrays():
     """CRYSTALClear leaves IR/Raman/intens empty when the output has no
     selection-rule analysis; the modes must then read "unknown" rather than
@@ -193,3 +260,98 @@ def test_dispersion_drops_the_dft_prefix():
     # older outputs name only the author, so there is no version to report
     assert _dispersion("GRIMME DISPERSION") == "yes"
     assert _dispersion(None) is None
+
+
+# ── atomic displacement parameters ────────────────────────────────────────
+# A minimal CRYSTAL ADP block: one temperature, one atom, a diagonal tensor of
+# 0.01/0.02/0.04 a.u.² so the bohr²→Å² conversion is checkable by hand. The
+# integer columns are CRYSTAL's own 10⁻⁴ Å² values, and the principal-values
+# line is in Å² — as the printed layout really is.
+_ADP_OUTPUT = """ <ADPS><ADPS><ADPS>
+
+                       ATOMIC DISPLACEMENT PARAMETERS (ADP)
+
+              COMPUTED VIA AN UNCORRELATED HARMONIC METROPOLIS MODEL
+
+ <ADPS><ADPS><ADPS>
+
+
+                               TEMPERATURE =  10.0000 K
+                    NUMBER OF ACTIVE MODES =     3
+
+
+ ATOM:     1
+
+               ADP TENSOR (a.u.^2)                          (10^-4 ang^2)
+
+    1.00000E-02    0.00000E+00    0.00000E+00             28      0      0
+    0.00000E+00    2.00000E-02    0.00000E+00              0     56      0
+    0.00000E+00    0.00000E+00    4.00000E-02              0      0    112
+
+         PRINCIPAL AXES OF THE ELLIPSOID
+
+    2.80028E-03    5.60056E-03    1.12011E-02             28     56    112
+
+                 ROTATION TENSOR
+
+    1.00000E+00    0.00000E+00    0.00000E+00
+    0.00000E+00    1.00000E+00    0.00000E+00
+    0.00000E+00    0.00000E+00    1.00000E+00
+
+ *******************************************************************************
+"""
+
+_BOHR_SQUARED = 0.529177210903 ** 2
+
+
+def _write_adp_out(tmp_path, text=_ADP_OUTPUT) -> str:
+    path = tmp_path / "adp.out"
+    path.write_text(text)
+    return str(path)
+
+
+def test_load_adp_returns_tensors_in_angstrom_squared(tmp_path):
+    pytest.importorskip("CRYSTALClear")
+    from crystalline.crystalio.loader import load_adp
+
+    adps = load_adp(_write_adp_out(tmp_path))
+
+    assert adps is not None
+    assert list(adps.temperatures) == [10.0]
+    assert adps.n_atoms == 1
+    # CRYSTAL prints the tensor in bohr²; a renderer and a CIF both want Å².
+    assert np.allclose(
+        np.diag(adps.tensors[0, 0]), np.array([0.01, 0.02, 0.04]) * _BOHR_SQUARED
+    )
+
+
+def test_load_adp_agrees_with_crystals_own_principal_values(tmp_path):
+    """The printed principal values sit under an ``(a.u.^2)`` header but are
+    already in Å² — the converted tensor's eigenvalues must reproduce them."""
+    pytest.importorskip("CRYSTALClear")
+    from crystalline.crystalio.loader import load_adp
+
+    adps = load_adp(_write_adp_out(tmp_path))
+
+    printed = [2.80028e-03, 5.60056e-03, 1.12011e-02]
+    assert np.allclose(np.sort(np.linalg.eigvalsh(adps.tensors[0, 0])), printed, rtol=1e-5)
+
+
+def test_load_adp_is_none_for_a_run_without_them(tmp_path):
+    """Most frequency runs have no ADP section; that is not an error."""
+    pytest.importorskip("CRYSTALClear")
+    from crystalline.crystalio.loader import load_adp
+
+    plain = tmp_path / "plain.out"
+    plain.write_text(" SOME OUTPUT\n EEEEEEEEEE TERMINATION\n")
+
+    assert load_adp(str(plain)) is None
+
+
+def test_load_adp_is_none_for_geometry_only_files(tmp_path):
+    from crystalline.crystalio.loader import load_adp
+
+    assert load_adp(_write_cif(tmp_path)) is None
+    gui = tmp_path / "structure.gui"
+    gui.write_text("3 1 1\n")
+    assert load_adp(str(gui)) is None

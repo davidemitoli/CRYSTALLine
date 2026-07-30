@@ -34,6 +34,29 @@ class RenderSettings:
     show_cell: bool = True
     show_lattice_vectors: bool = True
 
+    # phonon displacement arrows: the selected mode's eigenvector drawn on the
+    # atoms, so a mode reads in a still image instead of only while animating.
+    # Off by default — the animation is the primary view, and arrows on top of
+    # it are clutter until asked for. Every arrow is drawn the same length: they
+    # mark the *direction* each atom moves, and letting them shrink with each
+    # atom's share leaves the interesting small contributions invisible.
+    show_mode_arrows: bool = False
+    mode_arrow_scale: float = 1.2   # Angstrom, the length every arrow is drawn at
+    mode_arrow_color: str = "#d62728"
+
+    # thermal ellipsoids (ADP): the surface enclosing `adp_probability` of each
+    # atom's displacement distribution, drawn at one of the temperatures the
+    # output reported. Off unless the loaded file actually carries ADPs.
+    # Off here because most files carry no ADPs at all; the Display panel
+    # switches it on when a file that has them is opened.
+    show_adp_ellipsoids: bool = False
+    # ORTEP and structure reports draw 50%; 99% is the default here because
+    # computed ADPs are small enough that the conventional surface is hard to
+    # see on screen. Same tensor either way — only how far out it is drawn.
+    adp_probability: float = 0.99
+    adp_opacity: float = 0.85
+    adp_temperature_index: int = 0   # which reported temperature to draw
+
     # atom labels (element symbols drawn at each atom, capped for large cells)
     show_atom_labels: bool = False
     atom_label_size: int = 16  # point size of the element-symbol labels
