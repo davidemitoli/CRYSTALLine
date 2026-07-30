@@ -23,6 +23,7 @@ from typing import Optional
 import numpy as np
 from ase import Atoms
 
+from crystalline.core.adp import ADPSet
 from crystalline.core.phonons import PhononMode, PhononModes
 from crystalline.core.structure import Structure
 
@@ -122,7 +123,7 @@ def load_phonons(
     out = Crystal_output(path)
     out.get_phonon(read_eigvt=True, rm_imaginary=not keep_imaginary)
 
-    structure = Structure.from_ase(_pmg_to_ase(out.get_geometry(initial=False)))
+    structure = Structure.from_ase(_out_geometry_to_ase(out, initial=False))
     natom = len(structure)
 
     # frequency: (nqpoint, nmode) in THz -> converted to cm^-1 below.
@@ -153,6 +154,27 @@ def load_phonons(
     ]
 
     return structure, PhononModes(modes)
+
+
+def load_adp(path: str) -> Optional[ADPSet]:
+    """Load the atomic displacement parameters of a CRYSTAL ``.out``.
+
+    Returns ``None`` — never raises — when the file has no ``ADP`` section,
+    which is the common case: a frequency run only computes them if asked. The
+    tensors come back cartesian and in Angstrom squared, on the same atom
+    ordering as :func:`load_structure`.
+    """
+    if _is_gui(path) or _is_cif(path):
+        return None
+    try:
+        from CRYSTALClear.crystal_io import Crystal_output
+
+        out = Crystal_output(path).get_ADP()
+    except Exception:  # noqa: BLE001 - absent section, or an output it can't read
+        return None
+    if out.adp.size == 0 or len(out.adp_temperature) == 0:
+        return None
+    return ADPSet(temperatures=out.adp_temperature, tensors=out.adp)
 
 
 def _per_mode(values, nmode: int, cast=bool) -> list:
@@ -244,12 +266,14 @@ def read_atoms(path: str) -> Atoms:
 
 
 def output_properties(path: str) -> dict:
-    """Extract CRYSTAL-computed properties from a ``.out`` file, as (label, value).
+    """Extract what a CRYSTAL ``.out`` file says about itself, as (label, value).
 
-    Returns an ordered ``{label: value_string}`` of whatever this run reported —
-    total energy, band gap, Fermi energy. Empty for ``.gui`` files. Each getter
-    is guarded independently, so one that CRYSTALClear can't parse (some runs)
-    just omits its row rather than failing the whole panel.
+    Returns an ordered ``{label: value_string}``: first how the calculation was
+    set up (code, task, Hamiltonian and functional, k-point mesh, basis-set
+    size, SCF thresholds), then what it computed (total energy, band gap, Fermi
+    energy). Empty for ``.gui`` files. Every part is guarded independently, so
+    anything this particular run doesn't report — or that CRYSTALClear can't
+    parse — just omits its row rather than failing the whole panel.
     """
     if _is_gui(path):
         return {}
@@ -270,10 +294,121 @@ def output_properties(path: str) -> dict:
         except Exception:  # noqa: BLE001 - unexpected shape; skip this row
             return
 
+    props.update(_setup_rows(out))
     _try("Total energy (eV)", out.get_final_energy, lambda v: f"{float(v):.6f}")
     _try("Band gap (eV)", out.get_band_gap, lambda v: f"{float(np.ravel(v)[0]):.4f}")
     _try("Fermi energy (eV)", out.get_fermi_energy, lambda v: f"{float(np.ravel(v)[0]):.4f}")
     return props
+
+
+_SUPERSCRIPTS = str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹")
+
+# CRYSTAL spells functionals out in full ("PERDEW-BURKE-ERNZERHOF"), which
+# wraps over three lines in the dock. Show the acronym everyone uses instead —
+# matched exactly, so an unlisted functional keeps CRYSTAL's own wording rather
+# than being mislabelled.
+_FUNCTIONAL_ACRONYMS = {
+    "DIRAC-SLATER LDA": "LDA",
+    "VOSKO-WILK-NUSAIR": "VWN",
+    "PERDEW-BURKE-ERNZERHOF": "PBE",
+    "PERDEW-BURKE-ERNZERHOF (SOL)": "PBEsol",
+    "BECKE 88": "B88",
+    "LEE-YANG-PARR": "LYP",
+    "PERDEW-WANG 91": "PW91",
+    "PERDEW-WANG GGA": "PWGGA",
+    "PERDEW-ZUNGER": "PZ",
+    "PERDEW 86": "P86",
+    "WU-COHEN": "WC",
+    "VON BARTH-HEDIN": "VBH",
+}
+
+
+def _functional(name: Optional[str]) -> Optional[str]:
+    """The short name for a CRYSTAL functional, or its own wording."""
+    if not name:
+        return None
+    return _FUNCTIONAL_ACRONYMS.get(name.strip().upper(), name)
+
+
+def _dispersion(name: Optional[str]) -> Optional[str]:
+    """``DFT-D3(BJ)`` -> ``D3(BJ)``.
+
+    The "DFT-" prefix says nothing next to a row already labelled Dispersion.
+    """
+    if not name:
+        return None
+    label = name.strip().upper()
+    if label.startswith("DFT-"):
+        label = label[4:]
+    if "GRIMME" in label:  # older outputs name only the author, not the version
+        return "yes"
+    return label
+
+
+def _superscript(exponent: int) -> str:
+    """``-9`` -> ``⁻⁹``, so a power of ten reads as one in the panel."""
+    return str(exponent).translate(_SUPERSCRIPTS)
+
+
+def _setup_rows(out) -> dict:
+    """Display rows describing how the calculation was set up.
+
+    Reads ``Crystal_output.get_calculation_info`` (CRYSTALClear >= 0.2.16).
+    Older CRYSTALClear releases don't have it, so the panel simply falls back
+    to the computed-properties rows instead of erroring.
+    """
+    try:
+        info = out.get_calculation_info()
+    except Exception:  # noqa: BLE001 - absent method, or an output it can't read
+        return {}
+
+    rows: dict = {}
+
+    def _put(label: str, value) -> None:
+        """Add a row, dropping anything the output didn't report."""
+        if value is None or value == "" or value == []:
+            return
+        rows[label] = str(value)
+
+    _put("Code", info.get("code"))
+    _put("Task", " + ".join(info.get("run_type") or []))
+    if info.get("terminated") is False:
+        # Worth flagging: energies and geometries below may be from a partial run.
+        _put("Termination", "did not terminate normally")
+
+    method = info.get("method")
+    if method == "DFT" and info.get("hybrid_exchange"):
+        method = f"DFT (hybrid, {float(info['hybrid_exchange']):g}% exact exchange)"
+    _put("Method", method)
+    _put("Exchange", _functional(info.get("exchange")))
+    _put("Correlation", _functional(info.get("correlation")))
+    _put("Dispersion", _dispersion(info.get("dispersion")))
+    shell_type = info.get("shell_type")
+    _put("Shell type", shell_type.capitalize() if shell_type else None)
+
+    shrink = info.get("shrink")
+    if shrink:
+        # Mesh and count go on separate rows: together they were too wide for
+        # the dock and the count got cut off. Non-breaking spaces keep the mesh
+        # itself on one line in a narrow dock instead of one factor per line.
+        _put("k-point mesh", "\u00a0\u00d7\u00a0".join(str(int(s)) for s in shrink))
+    ibz = info.get("n_kpoints_ibz")
+    _put("k points (IBZ)", int(ibz) if ibz else None)
+
+    _put("Basis functions", info.get("n_ao"))
+    _put("Shells", info.get("n_shells"))
+    electrons, core = info.get("n_electrons"), info.get("n_core_electrons")
+    if electrons is not None:
+        _put("Electrons/cell", f"{int(electrons)} ({int(core)} core)" if core else electrons)
+    _put("Symmetry ops", info.get("n_symmops"))
+
+    toldee = info.get("toldee")
+    _put("SCF tolerance", f"10{_superscript(-int(toldee))} Ha" if toldee else None)
+    tolinteg = info.get("tolinteg")
+    _put("TOLINTEG", " ".join(str(int(t)) for t in tolinteg) if tolinteg else None)
+    grid = info.get("grid_points")
+    _put("DFT grid", f"{int(grid):,}" if grid else None)
+    return rows
 
 
 # ── shared by the savers ──────────────────────────────────────────────────
@@ -323,8 +458,35 @@ def _is_cif(path: str) -> bool:
 def _out_to_ase(path: str, initial: bool) -> Atoms:
     from CRYSTALClear.crystal_io import Crystal_output
 
-    geom = Crystal_output(path).get_geometry(initial=initial)
-    return _pmg_to_ase(geom)
+    return _out_geometry_to_ase(Crystal_output(path), initial=initial)
+
+
+def _out_geometry_to_ase(out, initial: bool) -> Atoms:
+    """The geometry of an open ``Crystal_output``, with its true dimensionality.
+
+    ``get_geometry`` returns a pymatgen ``Structure``, which is 3D-periodic by
+    construction: a 2D slab comes back flagged periodic along c as well, where
+    CRYSTAL has put a formal 500 Å vacuum vector. Consumers that trust ``pbc``
+    then treat that vacuum as a real lattice direction — the cell is drawn 500 Å
+    tall, and CrystalNN's Voronoi tessellation hangs on it. CRYSTAL states the
+    dimensionality in the output, so use it (as the ``.gui`` reader already does).
+    """
+    atoms = _pmg_to_ase(out.get_geometry(initial=initial))
+    atoms.set_pbc(_out_pbc(out))
+    return atoms
+
+
+def _out_pbc(out) -> tuple:
+    """CRYSTAL dimensionality as ase ``pbc`` — 3=bulk, 2=slab, 1=polymer, 0=molecule.
+
+    Falls back to fully periodic if the output doesn't state a dimensionality,
+    which is what every consumer assumed before.
+    """
+    try:
+        dim = int(out.get_dimensionality())
+    except Exception:  # noqa: BLE001 - absent/unparsable: keep the old assumption
+        return (True, True, True)
+    return (dim >= 1, dim >= 2, dim >= 3)
 
 
 def _cif_to_ase(path: str) -> Atoms:
@@ -363,6 +525,7 @@ def _gui_to_ase(path: str) -> Atoms:
 
 
 __all__ = [
+    "load_adp",
     "load_structure",
     "load_phonons",
     "save_structure_gui",

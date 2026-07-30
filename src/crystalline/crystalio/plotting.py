@@ -4,8 +4,10 @@ figures the UI can embed.
 Two kinds of source, distinguished by :attr:`PlotKind.source`:
 
 * ``"output"`` — read straight from the CRYSTAL ``.out`` via ``Crystal_output``
-  (IR/Raman spectra, elastic surfaces, equation of state). These need no extra
-  files, so the UI reuses the already-loaded output.
+  (elastic surfaces, equation of state). These need no extra files, so the UI
+  reuses the already-loaded output. Vibrational spectra are *not* among them:
+  they run to dozens of curves per file and have their own dialog, in
+  :mod:`crystalline.crystalio.spectra`.
 * ``"data"`` — need a PROPERTIES/dispersion data file (``BAND.DAT``, ``DOSS.DAT``,
   ``fort.25``, ``*SPEC.DAT``): electron/phonon bands & DOS, XRD.
 
@@ -109,25 +111,6 @@ def _plot_module():
 
 
 # ── builders: from a CRYSTAL .out via Crystal_output ────────────────────────
-def _spectrum_builder(getter: str, attribute: str) -> Callable[[str], object]:
-    """IR/Raman: run ``Crystal_output.getter()`` then broaden the stick spectrum.
-
-    ``getter`` populates ``attribute`` (an ``(N, 2)`` freq/intensity array) that
-    ``plot_cry_spec`` turns into a lineshape.
-    """
-
-    def build(path: str):
-        CCplt = _plot_module()
-        from CRYSTALClear.crystal_io import Crystal_output
-
-        co = Crystal_output(path)
-        getattr(co, getter)()
-        transitions = getattr(co, attribute)
-        return _to_figure(CCplt.plot_cry_spec(transitions))
-
-    return build
-
-
 def _elastic_builder(choose: str, ndeg: int = 100) -> Callable[[str], object]:
     """Elastic surface (Young/compressibility/shear/Poisson) from the elastic tensor."""
 
@@ -229,8 +212,9 @@ _DAT = "Data files (*.DAT *.dat *.f25 fort.25);;All files (*)"
 def available_plots() -> List[PlotKind]:
     """The plot kinds CRYSTALLine offers, in menu order.
 
-    Output-file plots (IR/Raman/elastic/EOS) read the loaded ``.out`` directly;
-    data-file plots (bands/DOS/XRD) prompt for the matching PROPERTIES file.
+    Output-file plots (elastic/EOS) read the loaded ``.out`` directly; data-file
+    plots (bands/DOS/XRD) prompt for the matching PROPERTIES file. IR and Raman
+    are handled by the vibrational-spectra dialog, not from here.
 
     The 2D elastic sections are listed only when the installed CRYSTALClear can
     draw them (it needs ``plot_cry_ela_2D``), so an older build just shows the
@@ -238,12 +222,10 @@ def available_plots() -> List[PlotKind]:
     """
     return [
         # ── from the CRYSTAL output file ──
-        PlotKind("ir", "IR spectrum", "output", "Open CRYSTAL output (.out)", _OUT,
-                 _spectrum_builder("get_IR", "IR_HO_0K"),
-                 probe=("get_IR", "IR_HO_0K")),
-        PlotKind("raman", "Raman spectrum", "output", "Open CRYSTAL output (.out)", _OUT,
-                 _spectrum_builder("get_Raman", "Ram_HO_0K_tot"),
-                 probe=("get_Raman", "Ram_HO_0K_tot")),
+        # IR and Raman are not here: a run's spectra span Raman polarisations
+        # and anharmonic levels, far more than two menu entries could offer, so
+        # they live behind the "Vibrational spectra…" dialog instead
+        # (see crystalline.crystalio.spectra).
         PlotKind("ela_young", "Young's modulus", "output", "Open CRYSTAL output (.out)", _OUT,
                  _elastic_builder("young"), group="Elastic properties",
                  probe=("get_elatensor", "elatensor")),
@@ -314,6 +296,101 @@ def crystalclear_available() -> bool:
         return False
 
 
+# ── typography ──────────────────────────────────────────────────────────────
+# Named font choices offered for every figure, as (label, key). Kept here rather
+# than read from CRYSTALClear so the setting works against any build of it, and
+# so a plot produced by CRYSTALLine itself (the spectra overlay) obeys it too.
+FONT_FAMILIES = (
+    ("Matplotlib default", "default"),
+    ("Computer Modern", "cm"),
+    ("Computer Modern Sans", "cmss"),
+    ("Serif", "serif"),
+    ("Sans-serif", "sans-serif"),
+    ("Monospace", "monospace"),
+)
+
+DEFAULT_FONT_FAMILY = "default"
+DEFAULT_FONT_SIZE = 10.0
+
+# Every recipe fixes the mathtext font set as well, so an axis label like
+# $\Phi^\mathbf{n}$ is typeset in the same face as the text around it instead of
+# keeping matplotlib's sans-serif maths.
+_FONT_RECIPES = {
+    "default": {"font.family": "sans-serif", "mathtext.fontset": "dejavusans"},
+    # Computer Modern is LaTeX's default face, so this is what makes a figure
+    # match the body text of a paper. 'cmr10' ships with matplotlib; 'CMU Serif'
+    # is the fuller Unicode cut of the same design and is preferred when present.
+    # No LaTeX installation is involved either way.
+    "cm": {
+        "font.family": "serif",
+        "font.serif": ["CMU Serif", "cmr10", "DejaVu Serif"],
+        "mathtext.fontset": "cm",
+        # cmr10 carries no U+2212, so a negative tick label would come out as a
+        # missing-glyph box; ASCII hyphens avoid that in every text artist.
+        "axes.unicode_minus": False,
+    },
+    "cmss": {
+        "font.family": "sans-serif",
+        "font.sans-serif": ["CMU Sans Serif", "cmss10", "DejaVu Sans"],
+        "mathtext.fontset": "cm",
+        "axes.unicode_minus": False,
+    },
+    "serif": {"font.family": "serif", "mathtext.fontset": "dejavuserif"},
+    "sans-serif": {"font.family": "sans-serif", "mathtext.fontset": "dejavusans"},
+    "monospace": {"font.family": "monospace", "mathtext.fontset": "dejavusans"},
+}
+
+# Restored before a recipe is applied, so switching away from Computer Modern
+# does not leave its Unicode-minus workaround or its font list behind.
+_FONT_RESET = {
+    "font.family": "sans-serif",
+    "font.serif": ["DejaVu Serif"],
+    "font.sans-serif": ["DejaVu Sans"],
+    "font.monospace": ["DejaVu Sans Mono"],
+    "mathtext.fontset": "dejavusans",
+    "axes.unicode_minus": True,
+}
+
+
+def apply_font(family: str = DEFAULT_FONT_FAMILY, size: float = DEFAULT_FONT_SIZE) -> dict:
+    """Set the font of every figure built afterwards, and report what was set.
+
+    matplotlib reads its rcParams when a figure is *created*, so this governs
+    plots opened from now on and leaves the ones already in the dock alone —
+    which is why the dialog says so.
+
+    ``family`` is a key of :data:`FONT_FAMILIES`, or the name of any installed
+    font ("Times New Roman"); an unknown name is passed to matplotlib as-is
+    rather than rejected, and matplotlib falls back with its own warning.
+    """
+    import matplotlib
+
+    recipe = _FONT_RECIPES.get(family)
+    if recipe is None:
+        # A font named directly. Whether it is a serif or a sans is not knowable
+        # here, so mathtext is left as the reset leaves it.
+        recipe = {"font.family": family}
+
+    applied = dict(_FONT_RESET)
+    applied.update(recipe)
+    applied["font.size"] = float(size)
+    matplotlib.rcParams.update(applied)
+    return applied
+
+
+def installed_font_names() -> list:
+    """Font families matplotlib can actually use, sorted, for the "other" box.
+
+    Empty if matplotlib is unavailable — the named recipes still work, since
+    they are only applied once a figure is being built.
+    """
+    try:
+        from matplotlib import font_manager
+    except Exception:  # noqa: BLE001 - matplotlib missing/broken
+        return []
+    return sorted({font.name for font in font_manager.fontManager.ttflist})
+
+
 def _probe_output(path: str, getter: str, attribute: str) -> bool:
     """Whether ``Crystal_output(path).getter()`` yields non-empty ``attribute``.
 
@@ -362,9 +439,14 @@ def output_availability(path: Optional[str]) -> set:
 
 
 __all__ = [
+    "DEFAULT_FONT_FAMILY",
+    "DEFAULT_FONT_SIZE",
+    "FONT_FAMILIES",
     "PlotKind",
     "PlotUnavailable",
+    "apply_font",
     "available_plots",
     "crystalclear_available",
+    "installed_font_names",
     "output_availability",
 ]

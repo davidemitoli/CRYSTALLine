@@ -20,7 +20,8 @@ import pytest
 pytest.importorskip("PySide6")
 
 from PySide6.QtGui import QAction  # noqa: E402
-from PySide6.QtWidgets import QApplication, QMainWindow, QMenu  # noqa: E402
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QDockWidget, QMainWindow, QMenu  # noqa: E402
 
 from crystalline.ui import menus  # noqa: E402
 
@@ -40,6 +41,16 @@ class _StubWindow(QMainWindow):
         self._show_boundary = True
         self._axis_actions: list = []
         self.viewport = self  # only align_view_along/can_align_axes are used
+        # The View menu builds a toggle per panel, so the docks must be real —
+        # __getattr__'s no-op would return None where a list is iterated.
+        self._docks = {}
+        for title in ("Info", "Display", "Geometry", "Phonons", "Plots"):
+            dock = QDockWidget(title, self)
+            self.addDockWidget(Qt.LeftDockWidgetArea, dock)
+            self._docks[title] = dock
+
+    def _panel_docks(self):
+        return list(self._docks.items())
 
     def align_view_along(self, axis: int) -> None:
         pass

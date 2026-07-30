@@ -308,3 +308,89 @@ def test_to_analysis_cell_passes_molecules_through():
     mol.add_atom("H", [0.96, 0.0, 0.0])
     out = to_analysis_cell(mol, np.zeros((3, 3)))  # degenerate cell, non-periodic
     assert len(out) == 2
+
+
+# ── per-atom payloads (ADP tensors riding the same replication as the modes) ──
+def _nacl() -> Structure:
+    return Structure.from_ase(bulk("NaCl", "rocksalt", a=5.64, cubic=True))
+
+
+def _tensors(n: int) -> np.ndarray:
+    """``(n, 3, 3)`` tensors, each distinguishable by its trace."""
+    return np.stack([np.eye(3) * (i + 1) for i in range(n)])
+
+
+def test_tiling_replicates_a_per_atom_payload_onto_the_images():
+    nacl = _nacl()
+    payload = _tensors(len(nacl))
+
+    supercell, _modes, tiled = tile_supercell(nacl, (2, 2, 2), None, per_atom=payload)
+
+    assert tiled.shape == (len(supercell), 3, 3)
+    # every image atom carries the tensor of the source atom it copies
+    for i in range(len(supercell)):
+        assert np.trace(tiled[i]) in {np.trace(u) for u in payload}
+    # ...and the counts work out: each source atom appears 8 times
+    traces = [np.trace(u) for u in tiled]
+    assert all(traces.count(np.trace(u)) == 8 for u in payload)
+
+
+def test_boundary_completion_replicates_a_per_atom_payload():
+    nacl = _nacl()
+    payload = _tensors(len(nacl))
+
+    packed, _modes, completed = complete_boundary(nacl, None, per_atom=payload)
+
+    assert len(packed) > len(nacl)  # images were added
+    assert completed.shape == (len(packed), 3, 3)
+    # Boundary completion reorders as it walks molecules, so check the tensors
+    # against the geometry rather than the order: every packed atom must carry
+    # the tensor of the source atom it is a lattice translation away from.
+    cell = np.asarray(nacl.cell, dtype=float)
+    for position, tensor in zip(packed.positions, completed):
+        fractional = np.linalg.solve(cell.T, (position - nacl.positions).T).T
+        parents = np.nonzero(np.all(np.abs(fractional - np.rint(fractional)) < 1e-6, axis=1))[0]
+        assert len(parents) == 1, "each packed atom images exactly one source atom"
+        assert np.allclose(tensor, payload[parents[0]])
+
+
+def test_omitting_the_payload_keeps_the_two_value_return():
+    """The common call is unchanged: only asking for a payload adds a third
+    element, as numpy's ``return_index`` does."""
+    nacl = _nacl()
+
+    assert len(tile_supercell(nacl, (2, 2, 2))) == 2
+    assert len(complete_boundary(nacl)) == 2
+    assert len(tile_supercell(nacl, (2, 2, 2), None, per_atom=_tensors(len(nacl)))) == 3
+
+
+def test_passing_no_payload_still_returns_three_values():
+    """``per_atom=None`` means "this file has nothing to replicate", not "don't
+    give me the third value" — a caller that asked for three must always get
+    three, or every file without ADPs fails to unpack."""
+    nacl = _nacl()
+    modes = PhononModes([])
+
+    for result in (
+        tile_supercell(nacl, (2, 2, 2), None, per_atom=None),
+        tile_supercell(nacl, (1, 1, 1), None, per_atom=None),  # the identity path too
+        complete_boundary(nacl, None, per_atom=None),
+        expand_modes_to_conventional(nacl, modes, per_atom=None),
+    ):
+        assert len(result) == 3
+        assert result[2] is None
+
+
+def test_a_payload_that_does_not_fit_is_dropped_not_misaligned():
+    """A conventional expansion can add atoms; indexing pre-expansion tensors by
+    a post-expansion mapping would hand back the wrong atoms' data."""
+    nacl = _nacl()
+
+    _sup, _modes, dropped = tile_supercell(nacl, (2, 2, 2), None, per_atom=_tensors(1))
+    assert dropped is None
+
+    # the identity case has no mapping to check against, so it checks the length
+    _same, _m, kept = tile_supercell(nacl, (1, 1, 1), None, per_atom=_tensors(len(nacl)))
+    assert kept is not None and len(kept) == len(nacl)
+    _same2, _m2, mismatched = tile_supercell(nacl, (1, 1, 1), None, per_atom=_tensors(3))
+    assert mismatched is None

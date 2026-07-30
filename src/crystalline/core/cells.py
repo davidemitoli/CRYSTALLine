@@ -177,6 +177,13 @@ def _wrap_molecules(atoms, mult: float = 1.15):
     return out
 
 
+# Default for the optional ``per_atom`` argument of the cell operations. A
+# distinct object rather than None, so that passing ``per_atom=None`` — a file
+# that simply has no ADPs — still returns the three-value form the caller asked
+# for, instead of a two-value one it would fail to unpack.
+_NO_PAYLOAD = object()
+
+
 def to_conventional(structure: Structure, symprec: float = 1e-2) -> Structure:
     """Return the crystallographic (conventional) cell of ``structure``.
 
@@ -199,6 +206,7 @@ def expand_modes_to_conventional(
     structure: Structure,
     modes: PhononModes,
     symprec: float = 1e-2,
+    per_atom=_NO_PAYLOAD,
 ) -> Tuple[Structure, PhononModes]:
     """Return the conventional cell together with phonon modes defined on it.
 
@@ -209,12 +217,17 @@ def expand_modes_to_conventional(
     the modes come back unchanged. The returned structure is molecule-wrapped to
     match :func:`to_conventional`; wrapping is pure lattice translation, so the
     per-atom eigenvectors still line up.
+
+    ``per_atom`` (ADP tensors, say) is replicated the same way — see
+    :func:`tile_supercell` for what passing it does to the return value.
     """
     atoms, mapping = _conventional_expansion(structure, symprec)
     expanded = PhononModes(
         [m.with_eigenvector(m.eigenvector[mapping]) for m in modes]
     )
-    return Structure.from_ase(_wrap_molecules(atoms)), expanded
+    return _with_payload(
+        Structure.from_ase(_wrap_molecules(atoms)), expanded, per_atom, mapping
+    )
 
 
 def as_view(structure: Structure, view: CellView) -> Structure:
@@ -232,6 +245,7 @@ def tile_supercell(
     structure: Structure,
     reps: Tuple[int, int, int],
     modes: Optional[PhononModes] = None,
+    per_atom=_NO_PAYLOAD,
 ) -> Tuple[Structure, Optional[PhononModes]]:
     """Tile ``structure`` ``reps`` = ``(na, nb, nc)`` times along its lattice vectors.
 
@@ -241,12 +255,19 @@ def tile_supercell(
     image atoms — correct at the Gamma point, where every image cell moves in
     phase — and returned alongside the supercell; the atom order is preserved so
     each image atom's eigenvector matches its parent.
+
+    ``per_atom`` is any array indexed by atom along its first axis — ADP tensors,
+    say — replicated the same way. *Passing* it adds a third element to the
+    returned tuple (as ``numpy``'s ``return_index`` does) rather than changing
+    the shape of the common two-value call. Passing ``None`` counts as passing:
+    a caller with nothing to replicate still gets three values, the third being
+    ``None``.
     """
     atoms = structure.to_ase()
     pbc = atoms.get_pbc()
     reps = tuple(int(r) if pbc[k] else 1 for k, r in enumerate(reps))
     if reps == (1, 1, 1) or not pbc.any():
-        return Structure.from_ase(atoms), modes
+        return _with_payload(Structure.from_ase(atoms), modes, per_atom, None)
 
     tagged = atoms.copy()
     tagged.set_array(_SOURCE_INDEX_KEY, np.arange(len(atoms)))
@@ -266,7 +287,40 @@ def tile_supercell(
         # Couldn't recover the mapping: drop the modes rather than hand back
         # eigenvectors whose atom count no longer matches the supercell.
         tiled_modes = None
-    return Structure.from_ase(supercell), tiled_modes
+    return _with_payload(Structure.from_ase(supercell), tiled_modes, per_atom, mapping)
+
+
+def _with_payload(structure, modes, per_atom, mapping):
+    """Assemble the return of a cell operation, with ``per_atom`` if asked for.
+
+    Whether the third element appears is decided by *passing* the argument, not
+    by its value: ``per_atom=None`` is a legitimate "this file has no ADPs", and
+    a caller that asked for three values must get three either way. Only the
+    :data:`_NO_PAYLOAD` sentinel — the default, meaning the argument was never
+    given — returns the plain two-value form.
+
+    ``mapping[i]`` is the source atom image atom ``i`` came from; ``None`` means
+    the operation was the identity (or its mapping couldn't be recovered), in
+    which case a payload that already matches the atom count passes through and
+    anything else is dropped rather than misaligned.
+
+    A payload too short for the mapping is dropped as well. That is not a
+    hypothetical: a conventional-cell expansion can add atoms, and indexing the
+    pre-expansion ADPs by a post-expansion mapping would either raise or, worse,
+    hand back tensors belonging to the wrong atoms.
+    """
+    if per_atom is _NO_PAYLOAD:
+        return structure, modes
+    if per_atom is None:
+        return structure, modes, None
+    payload = np.asarray(per_atom)
+    if mapping is None:
+        payload = payload if len(payload) == len(structure) else None
+    elif len(mapping) and int(np.max(mapping)) >= len(payload):
+        payload = None
+    else:
+        payload = payload[mapping]
+    return structure, modes, payload
 
 
 def _boundary_completion(structure: Structure, tol: float, mult: float = 1.15):
@@ -376,12 +430,15 @@ def complete_boundary(
     structure: Structure,
     modes: Optional[PhononModes] = None,
     tol: float = 2e-2,
+    per_atom=_NO_PAYLOAD,
 ) -> Tuple[Structure, Optional[PhononModes]]:
     """Return ``structure`` with boundary molecules/atoms completed by images.
 
     Every molecule that partially belongs to the unit cell is drawn whole, at
     each cell position it touches (all corners/edges/faces). Phonon ``modes`` are
-    replicated onto the image atoms (in phase, correct at Gamma).
+    replicated onto the image atoms (in phase, correct at Gamma), and so is
+    ``per_atom`` — see :func:`tile_supercell` for what that argument does to the
+    return value.
     """
     atoms, mapping = _boundary_completion(structure, tol)
     new_modes = modes
@@ -389,7 +446,7 @@ def complete_boundary(
         new_modes = PhononModes(
             [m.with_eigenvector(m.eigenvector[mapping]) for m in modes]
         )
-    return Structure.from_ase(atoms), new_modes
+    return _with_payload(Structure.from_ase(atoms), new_modes, per_atom, mapping)
 
 
 def to_analysis_cell(structure: Structure, unit_cell) -> Structure:

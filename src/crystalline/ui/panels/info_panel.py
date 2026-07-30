@@ -1,9 +1,10 @@
 """Info panel: crystallographic summary of the loaded system.
 
 Shows the space group, lattice parameters, density, formula, etc. (derived from
-the structure via :func:`crystalline.core.crystallography.analyze`), plus any
-CRYSTAL-computed properties read from the ``.out`` file (energy, band gap,
-Fermi energy).
+the structure via :func:`crystalline.core.crystallography.analyze`), plus what
+the CRYSTAL ``.out`` file says about itself — how the run was set up (code,
+task, functional, k-point mesh, basis size, SCF thresholds) and what it
+computed (energy, band gap, Fermi energy).
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QLabel,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -28,14 +30,26 @@ class InfoPanel(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        layout = QVBoxLayout(self)
+        # A CRYSTAL run reports a couple of dozen rows between the two groups —
+        # more than a dock is tall — so the whole summary scrolls rather than
+        # forcing the dock wider or clipping the last rows.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QScrollArea.NoFrame)
+        outer.addWidget(self._scroll)
+
+        content = QWidget()
+        self._scroll.setWidget(content)
+        layout = QVBoxLayout(content)
 
         self._crystal_group = QGroupBox("Crystallography")
-        self._crystal_form = QFormLayout(self._crystal_group)
+        self._crystal_form = _form(self._crystal_group)
         layout.addWidget(self._crystal_group)
 
         self._output_group = QGroupBox("CRYSTAL output")
-        self._output_form = QFormLayout(self._output_group)
+        self._output_form = _form(self._output_group)
         layout.addWidget(self._output_group)
         self._output_group.setVisible(False)
 
@@ -58,6 +72,20 @@ class InfoPanel(QWidget):
         self._output_group.setVisible(False)
 
 
+def _form(parent: QWidget) -> QFormLayout:
+    """A form whose rows survive a narrow dock.
+
+    Values used to be clipped at the right edge when the dock was narrower than
+    label + value (``8 × 8 × 8 (125 in the IBZ)`` showing as ``125 in the``).
+    ``WrapLongRows`` drops the value onto its own line instead, and the fields
+    are allowed to shrink rather than forcing the dock wider.
+    """
+    form = QFormLayout(parent)
+    form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+    form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+    return form
+
+
 def _fill(form: QFormLayout, rows: List[Tuple[str, str]]) -> None:
     """Replace the form's contents with ``(label, value)`` rows."""
     while form.rowCount():
@@ -65,6 +93,9 @@ def _fill(form: QFormLayout, rows: List[Tuple[str, str]]) -> None:
     for label, value in rows:
         value_label = QLabel(str(value))
         value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)  # copyable
+        # Long values (functional names above all) wrap instead of forcing the
+        # dock wider than the user sized it.
+        value_label.setWordWrap(True)
         form.addRow(f"{label}:" if label else "", value_label)
 
 

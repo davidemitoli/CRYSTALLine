@@ -145,6 +145,106 @@ def test_switching_files_resets_the_filter_and_the_selection(qapp):
     assert panel.current_mode_index() == 0
 
 
+def _co_numbers() -> list:
+    return list(_structure().numbers)
+
+
+def _localised_on(atom: int) -> PhononMode:
+    """A mode in which only ``atom`` of the two-atom C–O structure moves."""
+    eigenvector = np.zeros((2, 3))
+    eigenvector[atom] = [1.0, 0.0, 0.0]
+    return PhononMode(frequency=500.0, eigenvector=eigenvector)
+
+
+def test_composition_stays_out_of_the_row_and_in_the_tooltip(qapp):
+    """The row is for frequency and activity; composition has no room there."""
+    structure = _structure()
+    panel = _panel(structure)
+    modes = PhononModes([_localised_on(0), _localised_on(1)])
+
+    panel.set_modes(structure.positions, modes, structure.numbers)
+
+    rows = _rows(panel)
+    assert rows[0] == "0:    500.00 cm⁻¹"
+    assert "C" not in rows[0] and "O" not in rows[1]
+    assert "O 100%" in panel.mode_list.item(1).toolTip()
+
+
+def test_the_summary_line_describes_the_selected_mode(qapp):
+    structure = _structure()
+    panel = _panel(structure)
+    panel.set_modes(structure.positions, PhononModes([_localised_on(0), _localised_on(1)]),
+                    structure.numbers)
+
+    panel.mode_list.setCurrentRow(1)
+    assert "O 100%" in panel.character_label.text()
+    assert "1.0 of 2 atoms move" in panel.character_label.text()
+
+    panel.mode_list.setCurrentRow(0)
+    assert "C 100%" in panel.character_label.text()
+
+
+def test_modes_load_without_a_geometry_to_analyse(qapp):
+    """``numbers`` is optional — the panel falls back to bare frequencies."""
+    structure = _structure()
+    panel = _panel(structure)
+
+    panel.set_modes(structure.positions, _labelled_modes())
+
+    assert len(_rows(panel)) == 4
+    assert panel.character(0) is None
+    assert panel.character_label.text() == ""
+    assert panel.mode_list.item(0).toolTip() == ""
+
+
+def test_select_mode_reveals_one_the_filter_had_hidden(qapp):
+    """Clicking an IR peak must land on that mode even under a Raman filter."""
+    structure = _structure()
+    panel = _panel(structure)
+    panel.set_modes(structure.positions, _labelled_modes(), structure.numbers)
+    panel.filter_box.setCurrentIndex(2)  # Raman active: mode 0 (IR only) is hidden
+
+    assert panel.select_mode(0) is True
+
+    assert panel.current_mode_index() == 0
+    assert panel.filter_box.currentIndex() == 0  # dropped back to "All modes"
+
+
+def test_select_mode_rejects_an_index_that_is_not_a_mode(qapp):
+    structure = _structure()
+    panel = _panel(structure)
+    panel.set_modes(structure.positions, _labelled_modes(), structure.numbers)
+
+    assert panel.select_mode(99) is False
+    assert panel.select_mode(-1) is False
+
+
+def test_frequencies_are_exposed_for_matching_a_spectrum_click(qapp):
+    structure = _structure()
+    panel = _panel(structure)
+    assert panel.frequencies() is None  # nothing loaded
+
+    panel.set_modes(structure.positions, _labelled_modes(), structure.numbers)
+    assert list(panel.frequencies()) == [100.0, 200.0, 300.0, 400.0]
+
+
+def test_selecting_a_mode_puts_its_arrows_on_the_view(qapp):
+    from crystalline.viz.render_settings import RenderSettings
+
+    structure = _structure()
+    # Arrows are off by default; this is the behaviour once they're turned on.
+    renderer = StructureRenderer(pv.Plotter(off_screen=True),
+                                 RenderSettings(show_mode_arrows=True))
+    renderer.set_structure(structure)
+    panel = PhononPanel(PhononAnimator(renderer))
+
+    panel.set_modes(structure.positions, PhononModes([_localised_on(1)]), structure.numbers)
+    assert renderer._arrow_actor is not None
+
+    panel.clear()  # a file with no phonons must not leave the last mode's arrows
+    assert renderer._arrow_actor is None
+
+
 def test_speed_scales_the_phase_advanced_per_frame(qapp):
     """Speed changes how far the phase moves per timer tick, not the tick rate,
     so the animation stays smooth at every setting."""
@@ -232,3 +332,68 @@ def test_mode_list_can_shrink_so_every_control_stays_visible(qapp):
         assert widget.isVisible()
         assert widget.geometry().bottom() <= panel.height()
     panel.hide()
+
+
+def test_a_costly_frame_yields_the_event_loop_to_the_ui(qapp):
+    """A frame is a VTK rebuild plus a synchronous render; on a large cell it
+    outlasts the frame interval, and the timer then fires back to back with
+    nothing left for input — camera rotation stops tracking the mouse and buttons
+    take a visible moment. Beats are skipped until the animation is back within
+    its share of the loop."""
+    import time
+
+    from crystalline.ui.panels import phonon_panel as pp
+
+    structure = _structure()
+    panel = _panel(structure)
+    panel.set_modes(structure.positions, _labelled_modes())
+
+    frames = []
+    slow_frame = 0.02  # 20 ms, comfortably over _FRAME_DUTY of the 33 ms interval
+    panel._tick = lambda: (time.sleep(slow_frame), frames.append(1))
+
+    panel._on_timer()
+    assert frames == [1]  # the first beat draws
+
+    panel._on_timer()  # immediately after: still inside the hold-off
+    assert frames == [1], "a beat during the hold-off must not draw"
+
+    # The hold-off is proportional to what the frame cost, not a fixed sleep.
+    expected = slow_frame * (1.0 / pp._FRAME_DUTY - 1.0)
+    assert panel._next_frame_at - time.perf_counter() <= expected + 0.01
+
+    while time.perf_counter() < panel._next_frame_at:
+        pass
+    panel._on_timer()
+    assert frames == [1, 1]  # ...and it resumes once the loop has had its share
+
+
+def test_cheap_frames_are_not_paced_at_all(qapp):
+    """Small structures cost a fraction of the interval, so they keep the full
+    ~30 fps: the pacing must not slow down the common case."""
+    structure = _structure()
+    panel = _panel(structure)
+    panel.set_modes(structure.positions, _labelled_modes())
+
+    frames = []
+    panel._tick = lambda: frames.append(1)
+
+    for _ in range(5):
+        panel._on_timer()
+    assert frames == [1] * 5  # every beat drew
+
+
+def test_play_draws_the_first_frame_without_waiting(qapp):
+    """A hold-off left over from a previous run must not delay the next Play."""
+    structure = _structure()
+    panel = _panel(structure)
+    panel.set_modes(structure.positions, _labelled_modes())
+    panel._next_frame_at = float("inf")  # as a very slow previous frame would leave it
+
+    panel._play()
+
+    assert panel._next_frame_at == 0.0
+    frames = []
+    panel._tick = lambda: frames.append(1)
+    panel._on_timer()
+    assert frames == [1]

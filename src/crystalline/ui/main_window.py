@@ -13,6 +13,7 @@ import numpy as np
 from PySide6.QtCore import QRect, Qt
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -36,6 +37,7 @@ from crystalline.core.cells import (
     tile_supercell,
     to_analysis_cell,
 )
+from crystalline.core.adp import ADPSet
 from crystalline.core.phonons import PhononModes
 from crystalline.core.structure import Structure
 from crystalline.core.undo import UndoHistory
@@ -54,6 +56,11 @@ from crystalline.ui.panels.plot_view import PlotPanel
 _PLOT_FLOAT_WIDTH_FRACTION = 0.55
 _PLOT_FLOAT_MIN_WIDTH = 640
 _PLOT_FLOAT_MARGIN = 24
+
+# How far (cm⁻¹) a click may land from a mode and still be taken to mean it.
+# Wide enough to forgive aiming at a broadened peak's flank, narrow enough that
+# clicking empty baseline selects nothing.
+_PEAK_PICK_TOLERANCE = 20.0
 
 
 class MainWindow(QMainWindow):
@@ -74,6 +81,10 @@ class MainWindow(QMainWindow):
         self._show_boundary = True  # show partially-belonging molecules by default
         self._editing = False
         self._modes: Optional[PhononModes] = None
+        self._adps: Optional[ADPSet] = None  # thermal ellipsoids, if the run has them
+        # source-atom index of each displayed atom, so a per-atom quantity can be
+        # laid onto the (expanded, tiled, boundary-completed) cell on screen.
+        self._adp_index: Optional[np.ndarray] = None
         # Undo history for structure edits (snapshots of the shown cell). A view
         # change (supercell/boundary/lattice/load) re-derives from source and
         # resets it — those aren't part of the per-edit undo timeline.
@@ -82,9 +93,8 @@ class MainWindow(QMainWindow):
         self._output_path: Optional[str] = None  # last-loaded CRYSTAL .out, for plots
         self._output_props: dict = {}  # parsed CRYSTAL-output rows for the Info panel
         self._axis_actions: list = []  # a/b/c view-alignment actions (menu + toolbar)
-        self.structure, _, self._unit_cell, self._bond_structure = self._compose_view(
-            self._cell_view, self._supercell, None
-        )
+        (self.structure, _, self._unit_cell, self._bond_structure,
+         self._adp_index) = self._compose_view(self._cell_view, self._supercell, None)
 
         # right dock: phonon modes (built before the viewport listener, which
         # references it). Animator drives the renderer.
@@ -104,11 +114,11 @@ class MainWindow(QMainWindow):
         # as a dock — 3D picking/drag and the Edit menu drive editing instead.
         self.structure_panel = StructurePanel(self.structure, self)
         self.structure_panel.hide()
-        self._dock("Phonons", self.phonon_panel, Qt.RightDockWidgetArea)
+        self._phonon_dock = self._dock("Phonons", self.phonon_panel, Qt.RightDockWidgetArea)
 
         # left dock: crystallographic info of the loaded system
         self.info_panel = InfoPanel(self)
-        info_dock = self._dock("Info", self.info_panel, Qt.LeftDockWidgetArea)
+        info_dock = self._info_dock = self._dock("Info", self.info_panel, Qt.LeftDockWidgetArea)
         self.info_panel.show_structure(self._source)
 
         # left dock (tabbed behind Info): live display settings.
@@ -296,8 +306,232 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001 - surface any read/plot error to the user
             QMessageBox.critical(self, "Plot failed", f"Could not create the plot:\n{exc}")
             return
+        # No pick handler: none of these plots is drawn against a wavenumber
+        # axis. The spectra dialog's figures are, and pass one themselves.
         self.plot_panel.add_figure(figure, kind.label.rstrip("… "))
         self._reveal_plot_dock()
+
+    # ── thermal ellipsoids (ADP) ────────────────────────────────────────
+    def _load_adps(self, path: str) -> Optional[ADPSet]:
+        """The ADPs of the file just opened, or ``None`` if it carries none.
+
+        Most frequency runs don't: ADPs need the ``ADP`` keyword, so their
+        absence is the normal case and not worth reporting to the user.
+        """
+        try:
+            from crystalline.crystalio import load_adp
+
+            return load_adp(path)
+        except Exception:  # noqa: BLE001 - never let this break loading a file
+            return None
+
+    def _displayed_adp(self, temperature_index: Optional[int] = None) -> Optional[np.ndarray]:
+        """``(natom, 3, 3)`` tensors for the *source* cell at one temperature.
+
+        Defaults to the temperature the renderer's settings currently name;
+        ``temperature_index`` overrides it, which is what lets a settings change
+        be applied before the renderer has been told about it.
+        """
+        if self._adps is None or len(self._adps) == 0:
+            return None
+        if temperature_index is None:
+            temperature_index = self.viewport.renderer.settings.adp_temperature_index
+        return self._adps.at(temperature_index)
+
+    def _adp_tensors_for_view(self, temperature_index: Optional[int] = None) -> Optional[np.ndarray]:
+        """The chosen temperature's tensors laid onto the *displayed* atoms.
+
+        The displayed cell can be expanded, tiled and boundary-completed, so each
+        drawn atom takes the tensor of the source atom it images — that is what
+        ``self._adp_index`` records. Cheap enough to redo whenever the
+        temperature changes, which is the point of keeping the index around.
+        """
+        tensors = self._displayed_adp(temperature_index)
+        if tensors is None or self._adp_index is None or len(self._adp_index) == 0:
+            return None
+        if int(np.max(self._adp_index)) >= len(tensors):
+            return None  # ADPs don't span the source cell (a mismatched pairing)
+        return tensors[self._adp_index]
+
+    def _refresh_adp_tensors(self, temperature_index=None, redraw: bool = True) -> None:
+        """Push the ellipsoid tensors matching the current view and temperature."""
+        self.viewport.renderer.set_adp_tensors(
+            self._adp_tensors_for_view(temperature_index), redraw=redraw
+        )
+
+    def _update_adp_controls(self, autoshow: bool = False) -> None:
+        """Offer the ellipsoid controls only for a file that has ADPs.
+
+        ``autoshow`` is passed when a file has just been opened, so a run that
+        computed ADPs displays them without being asked. A view change re-lists
+        the same temperatures and leaves the toggle alone.
+        """
+        labels = [] if self._adps is None else [
+            self._adps.label(i) for i in range(len(self._adps))
+        ]
+        self.display_panel.set_adp_temperatures(labels, autoshow=autoshow)
+
+    # ── vibrational spectra ─────────────────────────────────────────────
+    def _open_spectra(self) -> None:
+        """Offer every spectrum the loaded output holds, and plot the chosen ones.
+
+        Raman polarisations and anharmonic levels between them run to dozens of
+        curves, so they live behind one dialog rather than one menu entry each,
+        and several can be overlaid at once — which is how the components are
+        actually read.
+        """
+        from crystalline.crystalio import available_spectra, load_spectra, plot_spectra
+        from crystalline.ui.panels.spectra_dialog import SpectraDialog
+
+        path = self._output_path
+        if not path:
+            QMessageBox.information(
+                self, "No output loaded",
+                "Load a CRYSTAL .out from a frequency calculation to plot its spectra.",
+            )
+            return
+        kinds = available_spectra(path)
+        if not kinds:
+            QMessageBox.information(
+                self, "No spectra in this output",
+                "This output carries no IR or Raman intensities.\n\n"
+                "IR needs a FREQCALC with INTENS; Raman additionally needs INTRAMAN "
+                "with a CPHF step; the VSCF/VPT2/VCI levels need ANHARM.",
+            )
+            return
+
+        dialog = SpectraDialog(kinds, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        chosen = dialog.selected_kinds()
+        try:
+            data = load_spectra(path)
+            figure = plot_spectra(
+                [(kind.label, data[kind]) for kind in chosen],
+                title=chosen[0].label if len(chosen) == 1 else None,
+                **dialog.options(),
+            )
+        except Exception as exc:  # noqa: BLE001 - surface any read/plot error
+            QMessageBox.critical(self, "Plot failed", f"Could not create the plot:\n{exc}")
+            return
+
+        title = chosen[0].label if len(chosen) == 1 else f"Spectra ({len(chosen)})"
+        # The x axis is a wavenumber, so clicking a peak still selects its mode.
+        self.plot_panel.add_figure(figure, title, on_pick=self._select_mode_near)
+        self._reveal_plot_dock()
+
+    def _update_spectra_action(self) -> None:
+        """Enable the spectra entry only for an output that has any."""
+        action = getattr(self, "_spectra_action", None)
+        if action is not None:
+            action.setEnabled(bool(self._output_path))
+
+    # ── VCI wavefunctions ───────────────────────────────────────────────
+    def _open_vci(self) -> None:
+        """Draw the VCI coefficients of the loaded output, the chosen way.
+
+        A VCI run carries one state per configuration, so there is no single
+        figure to show: the dialog is where which states — and how much mixing
+        to keep — get decided.
+        """
+        from crystalline.crystalio import plot_vci, vci_run
+        from crystalline.ui.panels.vci_dialog import VCIDialog
+
+        path = self._output_path
+        if not path:
+            QMessageBox.information(
+                self, "No output loaded",
+                "Load a CRYSTAL .out from an anharmonic calculation to plot "
+                "its VCI states.",
+            )
+            return
+
+        # Parsing a large run takes a moment, and it happens before any dialog
+        # appears, so say so with the cursor rather than looking hung.
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            run, out = vci_run(path)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if run is None:
+            QMessageBox.information(
+                self, "No VCI states in this output",
+                "This output carries no VCI wavefunctions.\n\n"
+                "They need an ANHARM run with a VCI step, on either the "
+                "harmonic (VCI@HO) or the VSCF (VCI@VSCF) basis.",
+            )
+            return
+
+        dialog = VCIDialog(run, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            figure = plot_vci(out, **dialog.options())
+        except Exception as exc:  # noqa: BLE001 - surface any plot error
+            QMessageBox.critical(self, "Plot failed", f"Could not create the plot:\n{exc}")
+            return
+
+        # No pick handler: neither representation is drawn against a wavenumber
+        # axis — the states sit on a categorical axis, one column each.
+        self.plot_panel.add_figure(figure, dialog.title())
+        self._reveal_plot_dock()
+
+    # ── plot typography ─────────────────────────────────────────────────
+    def _open_plot_font(self) -> None:
+        """Set the font of the plots built from now on.
+
+        Remembered on the window so reopening the dialog shows the current
+        choice rather than resetting to the default.
+        """
+        from crystalline.crystalio.plotting import (
+            DEFAULT_FONT_FAMILY,
+            DEFAULT_FONT_SIZE,
+            apply_font,
+        )
+        from crystalline.ui.panels.font_dialog import PlotFontDialog
+
+        family = getattr(self, "_plot_font_family", DEFAULT_FONT_FAMILY)
+        size = getattr(self, "_plot_font_size", DEFAULT_FONT_SIZE)
+
+        dialog = PlotFontDialog(family, size, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        chosen = dialog.options()
+        apply_font(**chosen)
+        self._plot_font_family = chosen["family"]
+        self._plot_font_size = chosen["size"]
+
+    def _update_vci_action(self) -> None:
+        """Enable the VCI entry only for an output that carries VCI states.
+
+        Uses the cheap text probe, not the real parse: this runs every time a
+        file is loaded, and parsing a large VCI block takes a second or two.
+        """
+        from crystalline.crystalio import has_vci
+
+        action = getattr(self, "_vci_action", None)
+        if action is not None:
+            action.setEnabled(has_vci(self._output_path))
+
+    # ── spectrum ↔ mode linking ─────────────────────────────────────────
+    def _select_mode_near(self, frequency: float) -> None:
+        """Select the mode nearest ``frequency`` (cm⁻¹) and reveal the Phonons dock.
+
+        Clicking a peak is how people ask "what is this band?", so the answer has
+        to be the structure moving, not a number. A click far from every mode is
+        ignored rather than snapping to a distant one: on a broadened spectrum
+        most of the x axis is baseline, and jumping to whatever happens to be
+        closest would be noise, not an answer.
+        """
+        frequencies = self.phonon_panel.frequencies()
+        if frequencies is None or len(frequencies) == 0:
+            return
+        index = int(np.argmin(np.abs(frequencies - frequency)))
+        if abs(frequencies[index] - frequency) > _PEAK_PICK_TOLERANCE:
+            return
+        if self.phonon_panel.select_mode(index):
+            self._phonon_dock.show()
+            self._phonon_dock.raise_()
 
     def _reveal_plot_dock(self) -> None:
         """Show the Plots dock — floating, the first time a plot is built.
@@ -328,8 +562,48 @@ class MainWindow(QMainWindow):
         self._display_dock.show()
         self._display_dock.raise_()
 
+    # ── panels ──────────────────────────────────────────────────────────
+    def _panel_docks(self) -> list:
+        """``(title, dock)`` for every panel, in the order the View menu lists them.
+
+        Closing a dock with its × is easy to do by accident and, without this,
+        impossible to undo — the panel is simply gone for the rest of the
+        session. Every dock is registered here so it can always be brought back.
+        """
+        return [
+            ("Info", self._info_dock),
+            ("Display", self._display_dock),
+            ("Geometry", self._geometry_dock),
+            ("Phonons", self._phonon_dock),
+            ("Plots", self._plot_dock),
+        ]
+
+    def _restore_all_panels(self) -> None:
+        """Bring every closed panel back, and float none of them.
+
+        A dock the user dragged out and then closed would otherwise reappear
+        floating off-screen if the window has since moved, so anything being
+        restored is re-docked on the way.
+        """
+        for _title, dock in self._panel_docks():
+            if dock.isHidden():
+                dock.setFloating(False)
+                dock.show()
+        self._info_dock.raise_()
+
     def _apply_render_settings(self, settings) -> None:
-        self.viewport.renderer.set_settings(settings)
+        """Apply new display settings, re-selecting the ADP temperature if it moved.
+
+        The temperature is a *setting*, but the tensors it names live on the
+        renderer — so moving the picker has to push the new ones as well, or the
+        ellipsoids keep the shape they were given when the file was loaded. They
+        are staged rather than drawn, so the settings change below is the single
+        rebuild the user sees.
+        """
+        renderer = self.viewport.renderer
+        if settings.adp_temperature_index != renderer.settings.adp_temperature_index:
+            self._refresh_adp_tensors(settings.adp_temperature_index, redraw=False)
+        renderer.set_settings(settings)
 
     def _restore_geometry(self) -> None:
         """Discard in-app edits and rebuild the originally-loaded geometry."""
@@ -612,13 +886,19 @@ class MainWindow(QMainWindow):
             return
         self._source = result.structure
         self._modes = result.modes if result.has_phonons else None
+        self._adps = self._load_adps(path)
         self._set_supercell((1, 1, 1))  # a fresh file starts at its own unit cell
         # Remember the output file so property plots (IR/Raman/elastic/EOS) can
         # read it directly; geometry-only files (.gui/.34/.cif) carry no such data.
         self._output_path = None if path.lower().endswith((".gui", ".34", ".cif")) else path
         self._apply_cell_view()
+        # After the view exists (and its ADP tensors have been pushed), so
+        # switching the ellipsoids on draws them straight away.
+        self._update_adp_controls(autoshow=True)
         self._update_info(path)
         self._update_plot_actions()  # enable only the plots this file supports
+        self._update_spectra_action()
+        self._update_vci_action()
         self._update_import_action()  # a structure is now loaded — allow importing
 
     def _import_atoms(self) -> None:
@@ -934,7 +1214,7 @@ class MainWindow(QMainWindow):
         "restore geometry": any in-app edits to the shown structure are dropped.
         """
         try:
-            shown, modes, unit_cell, analysis = self._compose_view(
+            shown, modes, unit_cell, analysis, source_index = self._compose_view(
                 self._cell_view, self._supercell, self._modes
             )
         except Exception as exc:  # noqa: BLE001 - symmetry analysis can fail
@@ -942,42 +1222,63 @@ class MainWindow(QMainWindow):
                 self, "Cell view unavailable", f"Could not build the crystallographic cell:\n{exc}"
             )
             # Fall back to the loaded cell as-is, which needs no analysis.
-            shown, modes, unit_cell, analysis = self._compose_view(
+            shown, modes, unit_cell, analysis, source_index = self._compose_view(
                 CellView.PRIMITIVE, self._supercell, self._modes
             )
 
         self._replace_structure(shown, unit_cell, analysis)
+        self._adp_index = source_index
+        self._refresh_adp_tensors()
+        self._update_adp_controls()
         if modes is not None:
-            self.phonon_panel.set_modes(self.structure.positions, modes)
+            self.phonon_panel.set_modes(
+                self.structure.positions, modes, self.structure.numbers
+            )
         else:
             self.phonon_panel.clear()
         self._update_export_actions()  # modes may have appeared/disappeared
 
     def _compose_view(self, view: CellView, supercell, modes):
-        """Return ``(structure, modes, unit_cell, analysis)`` for the composed view.
+        """Return ``(structure, modes, unit_cell, analysis, adp)`` for the view.
 
         Pipeline: crystallographic cell → supercell tiling → (optional) boundary
         completion. ``analysis`` is the clean periodic cell *before* boundary
         completion — it drives the bond/polyhedra coordination analysis, since
         the packed cell has duplicate images CrystalNN can't handle. ``unit_cell``
         is the pre-tiling cell, so the viewport keeps outlining the original cell.
-        ``modes`` is ``None`` when the file has no phonons.
+        ``modes`` is ``None`` when the file has no phonons. ``source_index[i]``
+        is the atom of ``self._source`` that displayed atom ``i`` is an image of;
+        it rides the same replication as the modes, and is what lets a per-atom
+        quantity (the ADP tensors) be laid onto the displayed geometry at any
+        time without recomposing the view.
         """
-        if view is CellView.CRYSTALLOGRAPHIC and modes is not None:
-            # One expansion produces a consistent structure + modes pair.
-            base, base_modes = expand_modes_to_conventional(self._source, modes)
+        # Carrying the source atom *indices* through the pipeline, rather than
+        # the ADP tensors themselves, keeps the cell operations ignorant of ADPs
+        # and makes changing the temperature a re-index instead of a re-tile.
+        base_index = np.arange(len(self._source))
+        if view is CellView.CRYSTALLOGRAPHIC:
+            # One expansion produces a consistent structure + modes + index triple.
+            base, expanded, base_index = expand_modes_to_conventional(
+                self._source, modes if modes is not None else PhononModes([]),
+                per_atom=base_index,
+            )
+            base_modes = expanded if modes is not None else None
         else:
             base, base_modes = as_view(self._source, view), modes
         unit_cell = base.cell.copy()
         # A clean periodic cell (before boundary completion) drives the
         # chemically-aware bond/polyhedra analysis — the packed cell has
         # duplicate images a near-neighbour algorithm can't handle.
-        analysis, analysis_modes = tile_supercell(base, supercell, base_modes)
+        analysis, analysis_modes, analysis_index = tile_supercell(
+            base, supercell, base_modes, per_atom=base_index
+        )
         if self._show_boundary:
-            shown, shown_modes = complete_boundary(analysis, analysis_modes)
+            shown, shown_modes, shown_index = complete_boundary(
+                analysis, analysis_modes, per_atom=analysis_index
+            )
         else:
-            shown, shown_modes = analysis, analysis_modes
-        return shown, shown_modes, unit_cell, analysis
+            shown, shown_modes, shown_index = analysis, analysis_modes, analysis_index
+        return shown, shown_modes, unit_cell, analysis, shown_index
 
     def _replace_structure(self, new: Structure, unit_cell=None, bond_structure=None) -> None:
         """Swap in a structure to display, rebinding the existing panels.
