@@ -141,16 +141,18 @@ def test_settings_toggle_bonds_cell_and_polyhedra():
     renderer = StructureRenderer(pv.Plotter(off_screen=True))
     renderer.set_structure(nacl)
     assert renderer._bond_actor is not None
-    assert renderer._polyhedra_actor is not None  # polyhedra on by default
+    # Polyhedra are off until asked for: they enclose the atoms they are built
+    # from, so a first look at a structure would be a first look at solids.
+    assert renderer._polyhedra_actor is None
+
+    renderer.set_settings(RenderSettings(show_polyhedra=True))
+    assert renderer._polyhedra_actor is not None  # octahedra drawn
 
     renderer.set_settings(
         RenderSettings(show_bonds=False, show_cell=False, show_polyhedra=False)
     )
     assert renderer._bond_actor is None and renderer._cell_actor is None
     assert renderer._polyhedra_actor is None
-
-    renderer.set_settings(RenderSettings(show_polyhedra=True))
-    assert renderer._polyhedra_actor is not None  # octahedra drawn
 
 
 def test_polyhedron_outline_shows_real_edges_only():
@@ -195,7 +197,8 @@ def test_polyhedra_get_an_outline_actor_and_a_translucent_default():
 
     renderer = StructureRenderer(pv.Plotter(off_screen=True))
     renderer.set_structure(nacl)
-    assert renderer._polyhedra_edge_actor is not None  # polyhedra (and outline) on by default
+    renderer.set_settings(RenderSettings(show_polyhedra=True))
+    assert renderer._polyhedra_edge_actor is not None
     assert renderer._polyhedra_edge_actor.GetMapper().GetInput().GetNumberOfCells() > 0
 
     renderer.set_settings(RenderSettings(show_polyhedra=False))

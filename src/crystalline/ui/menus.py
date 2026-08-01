@@ -210,6 +210,8 @@ def _build_plot_menu(window) -> None:
     disabled if CRYSTALClear is missing.
     """
     from crystalline.crystalio import available_plots, crystalclear_available
+    from crystalline.crystalio.anscan import plottable as anscan_plottable
+    from crystalline.crystalio.pes import plottable as pes_plottable
     from crystalline.crystalio.vci import plottable as vci_plottable
 
     plot_menu = window.menuBar().addMenu("&Plot")
@@ -242,6 +244,20 @@ def _build_plot_menu(window) -> None:
         window._vci_action = QAction("VCI states…", window)
         window._vci_action.triggered.connect(window._open_vci)
         plot_menu.addAction(window._vci_action)
+    # And for the anharmonic scan, where what goes on top of the potential —
+    # wavefunctions, densities, how tall — is the choice, and the coefficients
+    # come from a second file (see crystalline.crystalio.anscan).
+    if anscan_plottable():
+        window._anscan_action = QAction("Anharmonic scan…", window)
+        window._anscan_action.triggered.connect(window._open_anscan)
+        plot_menu.addAction(window._anscan_action)
+    # And for the PES an ANHAPES run differentiates: a quartic surface over
+    # every mode it was given, of which the figure is always a one- or two-mode
+    # cut (see crystalline.crystalio.pes).
+    if pes_plottable():
+        window._pes_action = QAction("Anharmonic PES…", window)
+        window._pes_action.triggered.connect(window._open_pes)
+        plot_menu.addAction(window._pes_action)
     # Typography applies to every figure, not to one kind, so it sits on its own
     # at the foot of the menu rather than inside any of the plot entries.
     plot_menu.addSeparator()

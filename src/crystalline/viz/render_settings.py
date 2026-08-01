@@ -61,8 +61,9 @@ class RenderSettings:
     show_atom_labels: bool = False
     atom_label_size: int = 16  # point size of the element-symbol labels
 
-    # coordination polyhedra (VESTA-style), shown by default
-    show_polyhedra: bool = True
+    # coordination polyhedra (VESTA-style), off until asked for: they hide the
+    # atoms they enclose, and a first look at a structure is usually the atoms
+    show_polyhedra: bool = False
     polyhedra_opacity: float = 0.3  # translucent enough to see the atoms inside
     polyhedra_min_vertices: int = 4  # only draw around atoms with >= this many bonds
 

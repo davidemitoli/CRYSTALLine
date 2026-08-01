@@ -97,6 +97,38 @@ def load_structure(path: str, initial: bool = False) -> Structure:
     return Structure.from_ase(_out_to_ase(path, initial=initial))
 
 
+def _structure_for_modes(out, natom_modes: int) -> Structure:
+    """The geometry an open output's phonon eigenvectors are defined on.
+
+    Normally the geometry of the run, but a SCELPHONO calculation builds a
+    supercell to get its force constants and then reports the modes of the cell
+    it expanded — 60 of them for a 20-atom cell whose geometry sections describe
+    540 atoms. Reshaping the eigenvectors against the wrong one is what used to
+    make such a file fail to open at all.
+
+    Raises:
+        ValueError: When neither cell has as many atoms as the modes span, so
+            that the message names the counts instead of a numpy reshape.
+    """
+    atoms = _out_geometry_to_ase(out, initial=False)
+    if len(atoms) == natom_modes:
+        return Structure.from_ase(atoms)
+
+    try:
+        primitive = _out_primitive_to_ase(out, initial=False)
+    except Exception:  # noqa: BLE001 - no primitive section to fall back on
+        primitive = None
+    if primitive is not None and len(primitive) == natom_modes:
+        return Structure.from_ase(primitive)
+
+    raise ValueError(
+        f"This run's phonon modes span {natom_modes} atoms, but its geometry "
+        f"has {len(atoms)}"
+        + (f" and its primitive cell {len(primitive)}" if primitive is not None else "")
+        + ". The modes cannot be placed on either cell."
+    )
+
+
 def load_phonons(
     path: str,
     qpoint: int = 0,
@@ -123,15 +155,15 @@ def load_phonons(
     out = Crystal_output(path)
     out.get_phonon(read_eigvt=True, rm_imaginary=not keep_imaginary)
 
-    structure = Structure.from_ase(_out_geometry_to_ase(out, initial=False))
-    natom = len(structure)
-
     # frequency: (nqpoint, nmode) in THz -> converted to cm^-1 below.
     # eigenvector at a q-point comes back per mode either flattened as
     # (3*natom,) or already (natom, 3), and may be complex (Gamma-point modes
     # are real up to a global phase -> take the real part).
     freqs = np.atleast_2d(np.asarray(out.frequency))[qpoint]
     eigvecs = np.asarray(out.eigenvector)[qpoint]
+
+    structure = _structure_for_modes(out, int(np.asarray(eigvecs[0]).size) // 3)
+    natom = len(structure)
 
     # IR/Raman selection rules are only printed for the Gamma point.
     nmode = len(freqs)
@@ -472,6 +504,19 @@ def _out_geometry_to_ase(out, initial: bool) -> Atoms:
     dimensionality in the output, so use it (as the ``.gui`` reader already does).
     """
     atoms = _pmg_to_ase(out.get_geometry(initial=initial))
+    atoms.set_pbc(_out_pbc(out))
+    return atoms
+
+
+def _out_primitive_to_ase(out, initial: bool) -> Atoms:
+    """The primitive cell of an open ``Crystal_output``, with its dimensionality.
+
+    The counterpart of :func:`_out_geometry_to_ase` for a run that expanded its
+    cell: after SCELPHONO the geometry sections describe the supercell the force
+    constants were computed in, while the modes CRYSTAL prints belong to the
+    cell that was expanded.
+    """
+    atoms = _pmg_to_ase(out.get_primitive_geometry(initial=initial))
     atoms.set_pbc(_out_pbc(out))
     return atoms
 
