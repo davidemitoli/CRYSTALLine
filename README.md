@@ -29,8 +29,8 @@
 
 **Structure viewer**
 - Interactive 3D view (PyVista/VTK): ball-and-stick atoms, bonds, hydrogen
-  bonds (dashed D–H···A interactions), coordination polyhedra (VESTA-style, shown
-  by default), the unit-cell wireframe and an a/b/c gizmo.
+  bonds (dashed D–H···A interactions), optional coordination polyhedra
+  (VESTA-style), the unit-cell wireframe and an a/b/c gizmo.
 - One-click view alignment down the **a**, **b** or **c** axis.
 - A rich, dockable **Display** panel: atom size/opacity, per-element colours,
   bond radius/tolerance, hydrogen bonds, cell, axes, polyhedra, measurement
@@ -85,9 +85,15 @@
   coupling.
 
 **Property plots** (via CRYSTALClear, shown in a dockable tabbed panel)
-- IR and Raman spectra, elastic properties (Young's modulus, linear compressibility,
-  shear modulus, Poisson ratio), equation of state.
-- Electronic and phonon band structures and densities of states, simulated XRD.
+- IR and Raman harmonic and anharmonic (VSCF, VCI) spectra
+- Anharmonic PES (1D, 2D)
+- VCI states representation (heatmap, Sankey plot)
+- Double-well potential energies, wavefunctions and probability densities
+- Elastic properties (Young's modulus, linear compressibility,
+  shear modulus, Poisson ratio)
+- Equation of state
+- Electronic and phonon band structures and densities of states,
+- Simulated XRD
 
 ## Installation
 
@@ -161,22 +167,56 @@ sudo apt install libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libx
 ## Screenshots
 
 <p align="center">
-  <img src="docs/screen1.png" alt="Main window" width="820"><br>
-  <em>The main window — crystallographic info, the interactive 3D view and the
-  phonon-mode list (brucite, Mg(OH)₂).</em>
+  <img src="docs/screen1.png" alt="The CRYSTALLine main window" width="900">
 </p>
 
 <p align="center">
-  <img src="docs/screen2.png" alt="Raman spectrum and animation export" width="820"><br>
-  <em>A computed Raman spectrum beside the structure, with the phonon-animation
-  export dialog (thiourea).</em>
+  <b>Everything in one window.</b><br>
+  Crystallography, the interactive 3D view and every vibrational mode —
+  recomputed live as you edit.<br>
+  <sub>Brucite, Mg(OH)₂ · P-3m1 · 1×3×1 supercell</sub>
 </p>
 
-<p align="center">
-  <img src="docs/screen3.png" alt="Display panel, polyhedra and elastic surface" width="820"><br>
-  <em>The Display panel and coordination polyhedra on a 2×2×2 supercell, with a
-  Young's modulus elastic surface.</em>
-</p>
+<br>
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screen2.png" alt="Raman spectrum and phonon-animation export"></td>
+    <td width="50%"><img src="docs/screen3.png" alt="Display panel, coordination polyhedra and an elastic surface"></td>
+  </tr>
+  <tr>
+    <td align="center" valign="top">
+      <b>🎬 Spectra, and modes as movies</b><br>
+      <sub>A computed Raman spectrum beside the structure. Click a peak to
+      select the mode behind it, animate it, and export the result as a GIF
+      or a video.<br><br>Thiourea · Pmc2₁ · 104 atoms</sub>
+    </td>
+    <td align="center" valign="top">
+      <b>🔷 Polyhedra and elastic surfaces</b><br>
+      <sub>VESTA-style coordination polyhedra on a 2×2×2 supercell, drawn as a
+      single mesh so thousands of atoms stay interactive, with a Young's-modulus
+      surface from the elastic tensor.<br><br>2496 atoms</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/plot_anscan.png" alt="Anharmonic scan of a double-well mode"></td>
+    <td width="50%"><img src="docs/plot_pes.png" alt="Anharmonic potential-energy surface of two coupled modes"></td>
+  </tr>
+  <tr>
+    <td align="center" valign="top">
+      <b>〰️ Anharmonic scans</b><br>
+      <sub>The scanned potential, the vibrational states it supports and the
+      probability density of each — here the double well of an imaginary mode,
+      whose two lowest states are split by tunnelling.<br><br>Pbnm perovskite · ANSCAN</sub>
+    </td>
+    <td align="center" valign="top">
+      <b>🏔️ Anharmonic PES</b><br>
+      <sub>How two normal modes couple through their cubic and quartic terms,
+      as a 3D surface or a contour map, with the harmonic bowl taken out so the
+      coupling is what you see.<br><br>CH₄ · modes 12 × 14 · ANHAPES</sub>
+    </td>
+  </tr>
+</table>
 
 ## Architecture
 
