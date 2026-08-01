@@ -39,6 +39,26 @@ from crystalline.crystalio.vci import (
     plot_vci,
     vci_run,
 )
+from crystalline.crystalio.anscan import (
+    WF_FILTER,
+    AnscanRun,
+    anscan_run,
+    find_wavefunctions,
+    has_anscan,
+    load_anscan,
+    plot_anscan,
+)
+from crystalline.crystalio.pes import (
+    DIMENSIONS,
+    QUANTITIES,
+    PESMode,
+    PESPair,
+    PESRun,
+    has_pes,
+    load_pes,
+    pes_run,
+    plot_pes,
+)
 
 __all__ = [
     "load",
@@ -67,4 +87,20 @@ __all__ = [
     "load_vci",
     "plot_vci",
     "vci_run",
+    "WF_FILTER",
+    "AnscanRun",
+    "anscan_run",
+    "find_wavefunctions",
+    "has_anscan",
+    "load_anscan",
+    "plot_anscan",
+    "DIMENSIONS",
+    "QUANTITIES",
+    "PESMode",
+    "PESPair",
+    "PESRun",
+    "has_pes",
+    "load_pes",
+    "pes_run",
+    "plot_pes",
 ]

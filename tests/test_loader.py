@@ -355,3 +355,76 @@ def test_load_adp_is_none_for_geometry_only_files(tmp_path):
     gui = tmp_path / "structure.gui"
     gui.write_text("3 1 1\n")
     assert load_adp(str(gui)) is None
+
+
+# ── which cell the phonon modes belong to ───────────────────────────────
+# A SCELPHONO run computes its force constants in a supercell and then reports
+# the modes of the cell it expanded: the geometry sections describe 540 atoms
+# while the eigenvectors span 20. Reshaping against the wrong one used to make
+# such a file refuse to open at all.
+class _FakeOutput:
+    """The three calls ``_structure_for_modes`` makes on a Crystal_output."""
+
+    def __init__(self, natom_cell, natom_primitive=None):
+        self._cell = self._structure(natom_cell)
+        self._primitive = (None if natom_primitive is None
+                           else self._structure(natom_primitive))
+
+    @staticmethod
+    def _structure(natom):
+        from pymatgen.core import Lattice, Structure as PmgStructure
+
+        return PmgStructure(
+            Lattice.cubic(4.0 * natom),
+            ["Si"] * natom,
+            [[i / natom, 0.0, 0.0] for i in range(natom)],
+        )
+
+    def get_geometry(self, initial=True, **kwargs):
+        return self._cell
+
+    def get_primitive_geometry(self, initial=True, **kwargs):
+        if self._primitive is None:
+            raise AttributeError("no primitive section in this output")
+        return self._primitive
+
+    def get_dimensionality(self):
+        return 3
+
+
+def test_modes_that_span_the_geometry_use_it():
+    pytest.importorskip("pymatgen")
+    from crystalline.crystalio.loader import _structure_for_modes
+
+    structure = _structure_for_modes(_FakeOutput(8, natom_primitive=2), 8)
+
+    assert len(structure) == 8
+
+
+def test_modes_of_an_expanded_cell_fall_back_to_the_primitive_one():
+    """The supercell is what the geometry sections describe; the modes belong
+    to the cell it was built from."""
+    pytest.importorskip("pymatgen")
+    from crystalline.crystalio.loader import _structure_for_modes
+
+    structure = _structure_for_modes(_FakeOutput(540, natom_primitive=20), 20)
+
+    assert len(structure) == 20
+
+
+def test_modes_matching_neither_cell_say_so_in_the_message():
+    """Better than numpy's 'cannot reshape array of size 60 into shape (540,3)',
+    which is what the user sees when a file will not open."""
+    pytest.importorskip("pymatgen")
+    from crystalline.crystalio.loader import _structure_for_modes
+
+    with pytest.raises(ValueError, match="7 atoms.*540.*primitive cell 20"):
+        _structure_for_modes(_FakeOutput(540, natom_primitive=20), 7)
+
+
+def test_an_output_with_no_primitive_section_still_reports_the_mismatch():
+    pytest.importorskip("pymatgen")
+    from crystalline.crystalio.loader import _structure_for_modes
+
+    with pytest.raises(ValueError, match="4 atoms"):
+        _structure_for_modes(_FakeOutput(8), 4)

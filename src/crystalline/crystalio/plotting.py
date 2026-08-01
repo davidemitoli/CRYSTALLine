@@ -391,16 +391,49 @@ def installed_font_names() -> list:
     return sorted({font.name for font in font_manager.fontManager.ttflist})
 
 
+# A line CRYSTAL only prints when the block a getter parses is actually there.
+# Checked before the getter runs, because the getters cost hundreds of times
+# more than a substring scan and this runs on every file open: get_EOS spends
+# ~126 ms on a 3 MB output establishing that it holds no equation of state,
+# which is the answer for nearly every file anyone opens.
+_PROBE_MARKERS = {
+    "get_elatensor": " SYMMETRIZED ELASTIC",
+    "get_EOS": "SORTING VOLUMES/ENERGIES",
+}
+
+
+def _has_marker(path: str, marker: str) -> bool:
+    """Whether ``marker`` appears anywhere in ``path``.
+
+    Line by line rather than one ``read()``: an output can run to tens of MB and
+    the marker is usually absent, so there is nothing to gain from holding the
+    whole file to answer no.
+    """
+    try:
+        with open(path, "r", errors="ignore") as handle:
+            return any(marker in line for line in handle)
+    except OSError:
+        return False
+
+
 def _probe_output(path: str, getter: str, attribute: str) -> bool:
     """Whether ``Crystal_output(path).getter()`` yields non-empty ``attribute``.
 
     Any parse/extraction failure (the data simply isn't in this run) counts as
     "not available". CRYSTALClear's chatter is swallowed so probing is silent.
+
+    A getter with a known banner is only run once that banner has been found:
+    the scan and the parse agree on absence, and the scan is the cheaper way to
+    establish it by two orders of magnitude.
     """
     import contextlib
     import io
 
     from CRYSTALClear.crystal_io import Crystal_output
+
+    marker = _PROBE_MARKERS.get(getter)
+    if marker is not None and not _has_marker(path, marker):
+        return False
 
     try:
         with contextlib.redirect_stdout(io.StringIO()):
@@ -417,7 +450,9 @@ def output_availability(path: Optional[str]) -> set:
 
     Returns an empty set when ``path`` is falsy (no output loaded) or CRYSTALClear
     is unavailable. Each distinct ``(getter, attribute)`` probe is run once even
-    though several elastic plots share it. Fast (~0.05 s for a typical output).
+    though several elastic plots share it, and a probe whose block is not in the
+    file at all is answered by a text scan rather than a parse — this runs on
+    every file open, so what it costs is what opening a file costs.
     """
     if not path:
         return set()

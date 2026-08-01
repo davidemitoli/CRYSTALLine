@@ -154,3 +154,73 @@ def test_output_availability_discriminates_by_file():
     assert "ela_young" not in plotting.output_availability(_FREQ[0])
 
 
+
+
+# ── what deciding the menu costs ────────────────────────────────────────
+# ``output_availability`` runs on every file open, and its getters are hundreds
+# of times dearer than reading the file: get_EOS spends ~126 ms on a 3 MB output
+# working out that it holds no equation of state. A banner check answers that
+# for the overwhelmingly common case — the block simply is not there.
+def test_a_probe_whose_banner_is_absent_never_parses(tmp_path, monkeypatch):
+    pytest.importorskip("CRYSTALClear")
+    import CRYSTALClear.crystal_io as crystal_io
+
+    plain = tmp_path / "freq.out"
+    plain.write_text(" MODES  EIGV  FREQUENCIES  IRREP\n EEEEEEEEEE TERMINATION\n")
+
+    def explode(*_a, **_k):
+        raise AssertionError("the getter was run for a block that is not there")
+
+    monkeypatch.setattr(crystal_io, "Crystal_output", explode)
+
+    assert plotting._probe_output(str(plain), "get_EOS", "VvsE") is False
+    assert plotting._probe_output(str(plain), "get_elatensor", "elatensor") is False
+
+
+def test_a_probe_whose_banner_is_present_still_parses(tmp_path, monkeypatch):
+    """The gate only rules blocks out; whether the data is really usable stays
+    the parser's call."""
+    pytest.importorskip("CRYSTALClear")
+    import CRYSTALClear.crystal_io as crystal_io
+
+    marked = tmp_path / "eos.out"
+    marked.write_text(" SORTING VOLUMES/ENERGIES\n EEEEEEEEEE TERMINATION\n")
+
+    ran = []
+
+    class _Spy:
+        def __init__(self, path):
+            ran.append(path)
+
+        def get_EOS(self):
+            raise ValueError("truncated block")
+
+    monkeypatch.setattr(crystal_io, "Crystal_output", _Spy)
+
+    assert plotting._probe_output(str(marked), "get_EOS", "VvsE") is False
+    assert ran, "the banner was there, so the parser should have been given a go"
+
+
+def test_a_probe_with_no_known_banner_is_unchanged(tmp_path, monkeypatch):
+    """Only the two dear getters are gated; anything added later must keep
+    working without an entry in the marker table."""
+    pytest.importorskip("CRYSTALClear")
+    import CRYSTALClear.crystal_io as crystal_io
+
+    path = tmp_path / "any.out"
+    path.write_text(" WHATEVER\n")
+
+    class _Stub:
+        def __init__(self, _path):
+            pass
+
+        def get_something(self):
+            self.something = [1, 2, 3]
+
+    monkeypatch.setattr(crystal_io, "Crystal_output", _Stub)
+
+    assert plotting._probe_output(str(path), "get_something", "something") is True
+
+
+def test_an_unreadable_file_is_not_available(tmp_path):
+    assert plotting._has_marker(str(tmp_path / "nope.out"), " SYMMETRIZED ELASTIC") is False

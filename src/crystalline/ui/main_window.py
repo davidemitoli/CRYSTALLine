@@ -476,6 +476,140 @@ class MainWindow(QMainWindow):
         self.plot_panel.add_figure(figure, dialog.title())
         self._reveal_plot_dock()
 
+    # ── anharmonic scan ─────────────────────────────────────────────────
+    def _open_anscan(self) -> None:
+        """Draw the anharmonic scan of the loaded output.
+
+        The wavefunction coefficients are not in the ``.out`` but in
+        ANSCANWF.DAT, so the file next to it is used when there is one and the
+        user is asked only when there is not.
+        """
+        import os
+
+        from crystalline.crystalio import (
+            WF_FILTER,
+            anscan_run,
+            find_wavefunctions,
+            plot_anscan,
+        )
+        from crystalline.ui.panels.anscan_dialog import AnscanDialog
+
+        path = self._output_path
+        if not path:
+            QMessageBox.information(
+                self, "No output loaded",
+                "Load a CRYSTAL .out from an ANSCAN run to plot its scan.",
+            )
+            return
+
+        wavefunctions = find_wavefunctions(path)
+        if wavefunctions is None:
+            wavefunctions, _ = QFileDialog.getOpenFileName(
+                self, "Open ANSCAN wavefunctions (ANSCANWF.DAT)",
+                os.path.dirname(path), WF_FILTER,
+            )
+            if not wavefunctions:
+                return
+
+        # get_anscan re-reads the phonon block on its way through, which is not
+        # instant on a large run, and it happens before any dialog appears.
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            run, out = anscan_run(path, wavefunctions)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if run is None:
+            QMessageBox.information(
+                self, "No anharmonic scan in this output",
+                "This output and its wavefunction file could not be read as an "
+                "ANSCAN run.\n\n"
+                "It needs a FREQCALC with ANHARM/ANSCAN, and the ANSCANWF.DAT "
+                "written by that same run.",
+            )
+            return
+
+        dialog = AnscanDialog(run, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            figure = plot_anscan(out, **dialog.options())
+        except Exception as exc:  # noqa: BLE001 - surface any plot error
+            QMessageBox.critical(self, "Plot failed", f"Could not create the plot:\n{exc}")
+            return
+
+        # No pick handler: the abscissa is the displacement the mode was scanned
+        # along, not a wavenumber, so there is no mode under the cursor.
+        self.plot_panel.add_figure(figure, dialog.title())
+        self._reveal_plot_dock()
+
+    def _update_anscan_action(self) -> None:
+        """Enable the scan entry only for an output that carries a solved one.
+
+        The cheap text probe, like the VCI entry: this runs on every load, and
+        the real parse walks the phonon block as well.
+        """
+        from crystalline.crystalio import has_anscan
+
+        action = getattr(self, "_anscan_action", None)
+        if action is not None:
+            action.setEnabled(has_anscan(self._output_path))
+
+    # ── anharmonic PES ──────────────────────────────────────────────────
+    def _open_pes(self) -> None:
+        """Draw a cut through the PES an ANHAPES run differentiated.
+
+        The surface spans every mode the run was given, so there is no single
+        figure: which mode, or which pair of them, is the dialog's job.
+        """
+        from crystalline.crystalio import pes_run, plot_pes
+        from crystalline.ui.panels.pes_dialog import PESDialog
+
+        path = self._output_path
+        if not path:
+            QMessageBox.information(
+                self, "No output loaded",
+                "Load a CRYSTAL .out from an anharmonic calculation to plot "
+                "its potential-energy surface.",
+            )
+            return
+
+        # Two parses — the PES constants and the harmonic frequencies — before
+        # any dialog appears, and neither is instant on a large run.
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            run, out = pes_run(path)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if run is None:
+            QMessageBox.information(
+                self, "No PES constants in this output",
+                "This output carries no cubic and quartic energy derivatives.\n\n"
+                "They need a FREQCALC with ANHARM/ANHAPES, whose harmonic "
+                "frequencies have to be in the same file.",
+            )
+            return
+
+        dialog = PESDialog(run, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            figure = plot_pes(out, **dialog.options())
+        except Exception as exc:  # noqa: BLE001 - surface any plot error
+            QMessageBox.critical(self, "Plot failed", f"Could not create the plot:\n{exc}")
+            return
+
+        # No pick handler: both axes are normal coordinates, not wavenumbers.
+        self.plot_panel.add_figure(figure, dialog.title())
+        self._reveal_plot_dock()
+
+    def _update_pes_action(self) -> None:
+        """Enable the PES entry only for an output that carries the constants."""
+        from crystalline.crystalio import has_pes
+
+        action = getattr(self, "_pes_action", None)
+        if action is not None:
+            action.setEnabled(has_pes(self._output_path))
+
     # ── plot typography ─────────────────────────────────────────────────
     def _open_plot_font(self) -> None:
         """Set the font of the plots built from now on.
@@ -899,6 +1033,8 @@ class MainWindow(QMainWindow):
         self._update_plot_actions()  # enable only the plots this file supports
         self._update_spectra_action()
         self._update_vci_action()
+        self._update_anscan_action()
+        self._update_pes_action()
         self._update_import_action()  # a structure is now loaded — allow importing
 
     def _import_atoms(self) -> None:
