@@ -185,9 +185,8 @@ sudo apt install libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libx
 
 <p align="center">
   <b>Everything in one window.</b><br>
-  Crystallography, the interactive 3D view and every vibrational mode —
-  recomputed live as you edit.<br>
-  <sub>Brucite, Mg(OH)₂ · P-3m1 · 1×3×1 supercell</sub>
+  Crystallography, the interactive 3D view and every vibrational mode,
+  recomputed live as you edit.
 </p>
 
 <br>
@@ -202,13 +201,13 @@ sudo apt install libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libx
       <b>🎬 Spectra, and modes as movies</b><br>
       <sub>A computed Raman spectrum beside the structure. Click a peak to
       select the mode behind it, animate it, and export the result as a GIF
-      or a video.<br><br>Thiourea · Pmc2₁ · 104 atoms</sub>
+      or a video.</sub>
     </td>
     <td align="center" valign="top">
       <b>🔷 Polyhedra and elastic surfaces</b><br>
       <sub>VESTA-style coordination polyhedra on a 2×2×2 supercell, drawn as a
-      single mesh so thousands of atoms stay interactive, with a Young's-modulus
-      surface from the elastic tensor.<br><br>2496 atoms</sub>
+      single mesh so thousands of atoms stay interactive, with a Young's modulus
+      surface from the elastic tensor.</sub>
     </td>
   </tr>
   <tr>
@@ -218,15 +217,15 @@ sudo apt install libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libx
   <tr>
     <td align="center" valign="top">
       <b>〰️ Anharmonic scans</b><br>
-      <sub>The scanned potential, the vibrational states it supports and the
-      probability density of each — here the double well of an imaginary mode,
-      whose two lowest states are split by tunnelling.<br><br>Pbnm perovskite · ANSCAN</sub>
+      <sub>Scanned potential, vibrational states and
+      probability densities. Here the double-well of an imaginary mode,
+      whose two lowest states are split by tunnelling.</sub>
     </td>
     <td align="center" valign="top">
       <b>🏔️ Anharmonic PES</b><br>
       <sub>How two normal modes couple through their cubic and quartic terms,
-      as a 3D surface or a contour map, with the harmonic bowl taken out so the
-      coupling is what you see.<br><br>CH₄ · modes 12 × 14 · ANHAPES</sub>
+      as a 3D surface or a contour map, with the harmonic contribution taken out so the
+      coupling is what you see.</sub>
     </td>
   </tr>
 </table>
